@@ -4,7 +4,7 @@ id = "sketchcad"
 version = "0.1.0"
 name = "SketchCAD"
 tagline = "Face-driven sketching with persistent datum planes"
-maintainer = "autoprogram"
+maintainer = "WooDafei"
 type = "add-on"
 blender_version_min = "5.3.0"
 

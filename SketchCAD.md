@@ -92,13 +92,14 @@ sketchcad/
     {"id": 2, "type": "circle", "center": [5, 5], "radius": 2.5, "construction": false}
   ],
   "constraints": [
-    {"id": 10, "type": "horizontal", "targets": [1], "enabled": true},
-    {"id": 11, "type": "distance",   "targets": [1], "value": 10.0, "enabled": true}
+    {"id": 10, "type": "coincident", "targets": [1, 2], "endpoints": [1, 0], "enabled": true},
+    {"id": 11, "type": "horizontal", "targets": [1], "enabled": true},
+    {"id": 12, "type": "distance",   "targets": [1], "value": 10.0, "enabled": true}
   ]
 }
 ```
 
-要点：`construction` 字段区分**构造线**（参与约束求解、不参与轮廓闭合，常用于对称/对齐参照）；约束 `enabled` 支持"禁用"（disable，可恢复）与"删除"（delete，彻底移除）两种语义。
+要点：`construction` 字段区分**构造线**（参与约束求解、不参与轮廓闭合，常用于对称/对齐参照）；约束 `enabled` 支持"禁用"（disable，可恢复）与"删除"（delete，彻底移除）两种语义。Phase 2 schema 细化：`coincident` 通过可选 `endpoints` 字段（0=p1, 1=p2）指定端点，默认 `[1, 0]`（前段终点接后段起点的折线连接惯例）；实体与约束**共用同一 id 空间**（递增时取两者最大值 +1）。
 
 ## 4. 专业级 2D 绘图与智能约束引擎（2D Drawing & Constraints）
 

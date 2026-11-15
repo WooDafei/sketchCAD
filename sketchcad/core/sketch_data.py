@@ -5,6 +5,12 @@ SketchCAD_Data；宿主 mesh 中提交的顶点/边只是退出时的产物。
 Phase 1 仅支持 line 实体，交互模型为多笔划折线：一次左键单击新增一个
 确认点，双击/Enter 结束当前笔划后可另起新笔划；撤销按"被弹点是否为
 最后一条段的终点"精确对应，跨笔划安全。
+
+Phase 2 起数据模型承载 constraints 数组（§4 约束系统）。schema 细化：
+- coincident 需要指定两端点（0=p1, 1=p2），存于可选 "endpoints" 字段，
+  折线连接惯例默认 [1, 0]（前段终点接后段起点）；
+- distance 携带 "value"（目标长度），残差采用 dx²+dy²-value² 光滑形式；
+- 实体与约束共用同一 id 空间（_next_id 取两者最大值 +1）。
 """
 
 import json
@@ -21,19 +27,62 @@ class SketchData:
         self.host = host if host is not None else {
             "object": None, "face_snapshot": None}
         self.entities = []
+        self.constraints = []
 
     # ---- 实体操作 ----
 
     def _next_id(self):
-        return max((e["id"] for e in self.entities), default=0) + 1
+        return max(
+            [e["id"] for e in self.entities]
+            + [c["id"] for c in self.constraints],
+            default=0) + 1
 
-    def add_line(self, p1, p2):
+    def add_line(self, p1, p2, construction=False):
         self.entities.append({
             "id": self._next_id(),
             "type": "line",
             "p1": [p1[0], p1[1]],
             "p2": [p2[0], p2[1]],
+            "construction": bool(construction),
         })
+
+    # ---- 约束操作 ----
+
+    def add_constraint(self, ctype, targets, value=None,
+                       endpoints=None, enabled=True):
+        con = {
+            "id": self._next_id(),
+            "type": ctype,
+            "targets": list(targets),
+            "enabled": bool(enabled),
+        }
+        if value is not None:
+            con["value"] = float(value)
+        if endpoints is not None:
+            con["endpoints"] = list(endpoints)
+        self.constraints.append(con)
+        return con
+
+    def constraint_by_id(self, cid):
+        for c in self.constraints:
+            if c["id"] == cid:
+                return c
+        return None
+
+    def remove_constraint(self, cid):
+        """删除（彻底移除）；与禁用（enabled=False，可恢复）语义分离。"""
+        for i, c in enumerate(self.constraints):
+            if c["id"] == cid:
+                self.constraints.pop(i)
+                return True
+        return False
+
+    def set_constraint_enabled(self, cid, enabled):
+        c = self.constraint_by_id(cid)
+        if c is None:
+            return False
+        c["enabled"] = bool(enabled)
+        return True
 
     def pop_line_ending_at(self, p):
         """仅当最后一条 line 的终点与 p 匹配（round6）时弹出该段。
@@ -87,6 +136,7 @@ class SketchData:
             },
             "host": self.host,
             "entities": self.entities,
+            "constraints": self.constraints,
         }
 
     @classmethod
@@ -100,6 +150,7 @@ class SketchData:
             return None
         s = cls(datum, host=data.get("host"))
         s.entities = list(data.get("entities") or [])
+        s.constraints = list(data.get("constraints") or [])
         return s
 
     def to_json(self):
