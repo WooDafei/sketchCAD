@@ -11,10 +11,16 @@ import gpu
 from gpu_extras.batch import batch_for_shader
 
 from ..core.state import state
+from ..solver.dof import STATUS_FULL, STATUS_OVER
 from ..snapping import snap
 
-HUD_TEXT = ("SketchCAD | LMB: add point | 2xLMB / Enter: end polyline | "
-            "RMB / Ctrl+Z: undo | ESC: finish & commit")
+_MODE_HINT = {
+    "draw": ("LMB: add point | 2xLMB / Enter: end polyline | "
+             "RMB / Ctrl+Z: undo | Tab: select | ESC: finish & commit"),
+    "select": ("LMB: pick line / drag endpoint to solve | "
+               "type number + Enter: dimension | RMB / Ctrl+Z: undo | "
+               "Tab: draw | ESC: deselect / finish"),
+}
 
 _COLOR_CROSS = (0.2, 0.6, 1.0, 1.0)
 _COLOR_LINES = (0.0, 0.85, 1.0, 1.0)
@@ -23,6 +29,8 @@ _COLOR_POINTS = (1.0, 1.0, 0.3, 1.0)
 _COLOR_MOUSE = (1.0, 1.0, 1.0, 0.9)
 _COLOR_SNAP_ENDPOINT = (1.0, 0.45, 0.1, 1.0)
 _COLOR_SNAP_MIDPOINT = (1.0, 0.3, 0.85, 1.0)
+_COLOR_SELECTED = (1.0, 0.5, 0.1, 1.0)
+
 
 _CROSS_SIZE = 0.2
 
@@ -30,13 +38,52 @@ _CROSS_SIZE = 0.2
 def _draw_hud_text():
     font_id = 0
     blf.size(font_id, 12)
+    mode = "SELECT" if state.mode == "select" else "DRAW"
     blf.color(font_id, 1.0, 1.0, 1.0, 0.85)
     blf.position(font_id, 24, 36)
-    blf.draw(font_id, HUD_TEXT)
+    blf.draw(font_id, f"SketchCAD [{mode}] | " + _MODE_HINT[state.mode])
+
+    y = 56
     if state.snap is not None:
         blf.color(font_id, 1.0, 0.75, 0.2, 1.0)
-        blf.position(font_id, 24, 56)
+        blf.position(font_id, 24, y)
         blf.draw(font_id, "SNAP: " + state.snap[0])
+        y += 20
+
+    if state.mode == "select":
+        parts = []
+        if state.selected_entity is not None:
+            parts.append(f"SEL: line {state.selected_entity}")
+        if state.input_buffer:
+            parts.append("value: " + state.input_buffer + "_")
+        if parts:
+            blf.color(font_id, 1.0, 0.8, 0.3, 1.0)
+            blf.position(font_id, 24, y)
+            blf.draw(font_id, " | ".join(parts))
+            y += 20
+        if state.solve_failed:
+            blf.color(font_id, 1.0, 0.35, 0.35, 1.0)
+            blf.position(font_id, 24, y)
+            blf.draw(font_id, "SOLVE FAILED - conflicting constraints?")
+            y += 20
+
+    rep = state.dof_report
+    if rep is None or state.sketch is None or rep.n_params == 0:
+        return
+    n_cons = len(state.sketch.constraints)
+    if rep.status == STATUS_OVER:
+        text = (f"DOF: {rep.dof} | CONS: {n_cons} | "
+                f"OVER-CONSTRAINED (redundant: {rep.n_redundant})")
+        blf.color(font_id, 1.0, 0.35, 0.35, 1.0)
+    elif rep.status == STATUS_FULL:
+        text = f"DOF: 0 | CONS: {n_cons} | fully constrained"
+        blf.color(font_id, 0.35, 1.0, 0.45, 1.0)
+    else:
+        text = f"DOF: {rep.dof} | CONS: {n_cons} | under-constrained"
+        blf.color(font_id, 0.65, 0.85, 1.0, 1.0)
+    blf.position(font_id, 24, y)
+    blf.draw(font_id, text)
+
 
 
 def draw_sketch():
@@ -73,6 +120,21 @@ def draw_sketch():
         shader.uniform_float("color", _COLOR_LINES)
         batch.draw(shader)
 
+    # 2.5 选中线段高亮（select 模式，加粗橙色）
+    if state.selected_entity is not None:
+        for e in state.sketch.entities:
+            if (e.get("id") == state.selected_entity
+                    and e.get("type") == "line"):
+                gpu.state.line_width_set(4.5)
+                batch = batch_for_shader(shader, 'LINES', {"pos": [
+                    d.to_world(e["p1"][0], e["p1"][1]),
+                    d.to_world(e["p2"][0], e["p2"][1])]})
+                shader.bind()
+                shader.uniform_float("color", _COLOR_SELECTED)
+                batch.draw(shader)
+                gpu.state.line_width_set(2.5)
+                break
+
     # 3. 橡皮筋：进行中笔划的末点 -> 鼠标候选点（黄色）
     if state.stroke_open and state.points_2d and state.mouse_2d is not None:
         last = state.points_2d[-1]
@@ -102,7 +164,8 @@ def draw_sketch():
         shader.uniform_float("color", _COLOR_MOUSE)
         batch.draw(shader)
 
-    # 6. 捕捉标记（端点橙 / 中点洋红，绘制于最高层）
+    # 5.5 捕捉标记（端点橙 / 中点洋红，绘制于最高层）
+    # （视口 GPU 标注已弃用：尺寸信息改由 N-Panel Item 式显示）
     if state.snap is not None:
         kind, p = state.snap
         gpu.state.point_size_set(14.0)

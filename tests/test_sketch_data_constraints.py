@@ -60,3 +60,27 @@ def test_add_line_construction_field():
     s.add_line((5, 5), (6, 6), construction=True)
     assert s.entities[0]["construction"] is False
     assert s.entities[1]["construction"] is True
+
+def test_pop_line_cascades_constraints():
+    s = make_sketch()
+    s.add_line((0, 0), (3, 0))          # id 1
+    s.add_line((3, 0), (3, 2))          # id 2
+    s.add_constraint("coincident", [1, 2], endpoints=[1, 0])  # id 3
+    s.add_constraint("horizontal", [1])                       # id 4
+    s.add_constraint("horizontal", [2])                       # id 5
+    assert s.pop_line_ending_at((3, 2)) is True   # 弹段 2
+    assert len(s.entities) == 1
+    ids = {c["id"] for c in s.constraints}
+    assert 3 not in ids and 5 not in ids          # 指向段 2 的被级联删除
+    assert 4 in ids                               # 指向段 1 的保留
+
+
+def test_remove_entity_and_constraints():
+    s = make_sketch()
+    s.add_line((0, 0), (1, 0))
+    s.add_line((5, 5), (6, 6))
+    s.add_constraint("horizontal", [1])
+    assert s.remove_entity_and_constraints(1) is True
+    assert s.entities[0]["id"] == 2
+    assert s.constraints == []
+    assert s.remove_entity_and_constraints(99) is False

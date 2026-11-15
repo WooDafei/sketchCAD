@@ -11,6 +11,8 @@
   结束后可另起新折线，数据层按独立 line 段存储。
 """
 
+import time
+
 import bmesh
 
 import bpy
@@ -26,10 +28,26 @@ from .. import manager
 from ..core import sketch_data as skd
 from ..core.datum import Datum
 from ..core.state import state
+from ..drawing import auto_constraints as ac
+from ..drawing import picking
 from ..gpu.draw_2d import draw_sketch
+from ..solver import apply as solver_apply
+from ..solver import dof as solver_dof
 from ..snapping import snap
 
 _NAV_EVENTS = {'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'MIDDLEMOUSE'}
+
+# select 模式数值输入的事件键（主键盘数字 / 小键盘数字 / 小数点）
+_DIGIT_KEYS = {str(i) for i in range(10)}
+_NUMPAD_DIGIT = {f"NUMPAD_{i}": str(i) for i in range(10)}
+_PERIOD_KEYS = ('PERIOD', 'NUMPAD_PERIOD')
+
+# 草图会话中放行给 N-Panel（UI region）的鼠标事件（约束管理/阈值配置）
+_UI_PASS_EVENTS = {'LEFTMOUSE', 'RIGHTMOUSE', 'MIDDLEMOUSE', 'MOUSEMOVE',
+                   'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}
+
+# 拖动实时求解的节流间隔（~60Hz；20 实体规模单次求解 ~15ms，见 bench_20x30）
+_DRAG_SOLVE_INTERVAL = 1.0 / 60.0
 
 
 class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
@@ -99,6 +117,7 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         state.sketch = sketch
         state.container_name = container_name
         state.points_2d = sketch.rebuild_points()
+        self._refresh_dof()
 
         self._align_view(context, sketch.datum)
 
@@ -107,7 +126,8 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
 
         context.window_manager.modal_handler_add(self)
         self.report({'INFO'},
-                    "SketchCAD 草图模式 | 左键加点 | 双击/Enter 结束折线"
+                    "SketchCAD 草图模式 | 画线: 左键加点, 双击/Enter 结束"
+                    " | Tab 选择模式(点线+输数值+回车定尺寸)"
                     " | 右键/Ctrl+Z 撤销 | ESC 提交退出")
         return {'RUNNING_MODAL'}
 
@@ -133,29 +153,49 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
 
     # ---- Modal ----
 
+
     def modal(self, context, event):
         if not state.active:
             return {'FINISHED'}
         context.area.tag_redraw()
 
+        # N-Panel（UI region）事件放行：草图进行中可用侧边栏
+        if (event.type in _UI_PASS_EVENTS
+                and self._cursor_in_ui_region(context, event)):
+            return {'PASS_THROUGH'}
+
         if event.type == 'MOUSEMOVE':
             self._update_mouse(context, event)
+            if state.dragging is not None:
+                self._drag_update()
             return {'RUNNING_MODAL'}
+
+        if event.type == 'TAB' and event.value == 'PRESS':
+            self._toggle_mode()
+            return {'RUNNING_MODAL'}
+
+        if (event.value == 'PRESS' and state.mode == "select"
+                and state.selected_entity is not None):
+            if self._on_input_key(event.type):
+                return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             if state.mouse_2d is not None:
-                if not state.stroke_open:
+                if state.mode == "select":
+                    self._press_select(context, state.mouse_2d)
+                elif not state.stroke_open:
                     # 新折线起点：只记录点，不与历史末点拼段
                     state.points_2d.append(state.mouse_2d)
                     state.stroke_open = True
                 else:
-                    prev = state.points_2d[-1]
-                    same = (
-                        round(prev[0], 6), round(prev[1], 6)) == (
-                        round(state.mouse_2d[0], 6), round(state.mouse_2d[1], 6))
-                    if not same:
-                        state.points_2d.append(state.mouse_2d)
-                        state.sketch.add_line(prev, state.mouse_2d)
+                    self._confirm_segment(context, state.mouse_2d)
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            if state.dragging is not None:
+                state.dragging = None
+                self._refresh_dof()
+                self.report({'INFO'}, "拖动求解结束")
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'DOUBLE_CLICK':
@@ -164,7 +204,10 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             return {'RUNNING_MODAL'}
 
         if event.type == 'RET' and event.value == 'PRESS':
-            state.stroke_open = False
+            if state.mode == "select":
+                self._apply_dimension()
+            else:
+                state.stroke_open = False
             return {'RUNNING_MODAL'}
 
         if ((event.type == 'RIGHTMOUSE' or (event.type == 'Z' and event.ctrl))
@@ -173,6 +216,12 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             return {'RUNNING_MODAL'}
 
         if event.type == 'ESC' and event.value == 'PRESS':
+            if state.mode == "select" and (
+                    state.selected_entity is not None or state.input_buffer):
+                # 先清选中/取消输入，再按一次 ESC 才退出草图
+                state.selected_entity = None
+                state.input_buffer = ""
+                return {'RUNNING_MODAL'}
             return self._finish(context)
 
         if event.type in _NAV_EVENTS:
@@ -229,10 +278,185 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         if not state.points_2d:
             return
         popped = state.points_2d.pop()
-        # 仅当最后一条段的终点恰为被弹点时才撤销该段（跨笔划安全）
+        # 仅当最后一条段的终点恰为被弹点时才撤销该段（跨笔划安全）；
+        # 弹段在 sketch_data 内级联清理其自动约束
         state.sketch.pop_line_ending_at(popped)
         if not state.points_2d:
             state.stroke_open = False
+        if (state.selected_entity is not None
+                and all(e["id"] != state.selected_entity
+                        for e in state.sketch.entities)):
+            # 选中的段已被撤销，清空选择态防悬空
+            state.selected_entity = None
+            state.input_buffer = ""
+        self._refresh_dof()
+
+    def _confirm_segment(self, context, p2):
+        """确认连续段：推断水平/垂直并吸附，写入实体与自动约束。
+
+        端点与既有实体端点重合（捕捉对齐 / 折线连续 / 闭合轮廓）时
+        写入 coincident 固接，端点定位沿用 round6 语义。
+        """
+        prev = state.points_2d[-1]
+        same = (
+            round(prev[0], 6), round(prev[1], 6)) == (
+            round(p2[0], 6), round(p2[1], 6))
+        if same:
+            return
+        tol = state.hv_pixel_tol * self._world_per_pixel(context)
+        ctype = ac.classify_segment(prev, p2, tol)
+        if ctype is not None:
+            _, p2 = ac.snapped_segment(prev, p2, ctype)
+        state.points_2d.append(p2)
+
+        sketch = state.sketch
+        sketch.add_line(prev, p2)
+        new_id = sketch.entities[-1]["id"]
+        for point, new_pos in ((prev, 0), (p2, 1)):
+            hit = ac.find_endpoint_hit(point, sketch.entities,
+                                       exclude_id=new_id)
+            if hit is not None:
+                sketch.add_constraint(
+                    ac.COINCIDENT, [new_id, hit[0]],
+                    endpoints=[new_pos, hit[1]])
+        if ctype is not None:
+            sketch.add_constraint(ctype, [new_id])
+        self._refresh_dof()
+
+    def _refresh_dof(self):
+        """实体/约束变化后刷新 DOF 报告缓存（不进 MOUSEMOVE 每帧路径）。"""
+        if state.sketch is not None:
+            state.dof_report = solver_dof.analyze(
+                state.sketch.entities, state.sketch.constraints)
+
+    def _world_per_pixel(self, context):
+        """正交正视近似换算：可视世界高度 / 视口像素高度。"""
+        region = context.region
+        rv3d = context.region_data
+        if region is None or rv3d is None:
+            return 0.0
+        return rv3d.view_distance * 2.0 / max(region.height, 1)
+
+    def _cursor_in_ui_region(self, context, event):
+        """鼠标是否位于 N-Panel（UI region）矩形内（窗口坐标判定）。"""
+        if context.area is None:
+            return False
+        for r in context.area.regions:
+            if r.type == 'UI':
+                return (r.x <= event.mouse_x < r.x + r.width
+                        and r.y <= event.mouse_y < r.y + r.height)
+        return False
+
+    # ---- 选择模式与尺寸驱动（SketchCAD.md §4）----
+
+    def _toggle_mode(self):
+        # 切换前结束进行中的笔划，防跨模式状态错乱
+        state.stroke_open = False
+        state.mode = "select" if state.mode == "draw" else "draw"
+        state.selected_entity = None
+        state.input_buffer = ""
+        state.solve_failed = False
+        state.dragging = None
+        if state.mode == "draw":
+            self.report({'INFO'}, "SketchCAD：画线模式（左键加点）")
+        else:
+            self.report({'INFO'},
+                        "SketchCAD：选择模式——点击线段选中，输入数值后"
+                        "回车定尺寸，Tab 返回画线")
+
+    def _select_at(self, context, p):
+        tol = picking.SELECT_PIXEL_TOL * self._world_per_pixel(context)
+        state.selected_entity = picking.pick_segment(
+            p, state.sketch.entities, tol)
+        state.input_buffer = ""
+        state.solve_failed = False
+
+    def _press_select(self, context, p):
+        """select 模式按下：端点命中则进入拖动求解，否则选线段。"""
+        tol = picking.SELECT_PIXEL_TOL * self._world_per_pixel(context)
+        hit = picking.pick_endpoint(p, state.sketch.entities, tol)
+        if hit is not None:
+            state.dragging = hit
+            state.selected_entity = hit[0]
+            state.solve_failed = False
+            state.drag_last_solve = 0.0
+        else:
+            self._select_at(context, p)
+
+    def _drag_update(self):
+        """拖动端点实时求解（节流 ~60Hz；失败时保持上次成功几何）。"""
+        now = time.perf_counter()
+        if now - state.drag_last_solve < _DRAG_SOLVE_INTERVAL:
+            return
+        state.drag_last_solve = now
+        eid, pos = state.dragging
+        if state.mouse_2d is None:
+            return
+        for e in state.sketch.entities:
+            if e.get("id") == eid:
+                x, y = state.mouse_2d
+                if pos == 0:
+                    e["p1"] = [x, y]
+                else:
+                    e["p2"] = [x, y]
+                break
+        else:
+            state.dragging = None  # 实体已不在（被撤销等），结束拖动
+            return
+        self._solve_and_apply()
+        self._refresh_dof()
+
+    def _on_input_key(self, key_type):
+        """收集数值输入；返回事件是否被消费（仅选中态有效）。"""
+        if key_type in _NUMPAD_DIGIT or key_type in _DIGIT_KEYS:
+            state.input_buffer += _NUMPAD_DIGIT.get(key_type, key_type)
+            return True
+        if key_type in _PERIOD_KEYS:
+            if "." not in state.input_buffer:
+                state.input_buffer = (state.input_buffer or "0") + "."
+            return True
+        if key_type == 'BACKSPACE':
+            state.input_buffer = state.input_buffer[:-1]
+            return True
+        return False
+
+    def _apply_dimension(self):
+        """数值确认：创建/更新选中线段的 distance 约束并求解回写。"""
+        if state.selected_entity is None or not state.input_buffer:
+            return
+        try:
+            value = float(state.input_buffer)
+        except ValueError:
+            state.input_buffer = ""
+            return
+        if value <= 0:
+            state.input_buffer = ""
+            self.report({'WARNING'}, "尺寸必须为正数")
+            return
+        sketch = state.sketch
+        eid = state.selected_entity
+        existing = None
+        for c in sketch.constraints:
+            if (c.get("type") == "distance" and c.get("enabled", True)
+                    and eid in (c.get("targets") or [])):
+                existing = c
+                break
+        if existing is not None:
+            existing["value"] = value
+        else:
+            sketch.add_constraint("distance", [eid], value=value)
+        state.input_buffer = ""
+        if self._solve_and_apply():
+            self.report({'INFO'}, f"尺寸已应用：{value:g}")
+        self._refresh_dof()
+
+    def _solve_and_apply(self):
+        """以约束系统为准从当前几何求解；成功回写坐标，失败几何不动。"""
+        ok, message = solver_apply.solve_and_apply(state.sketch)
+        state.solve_failed = not ok
+        if not ok:
+            self.report({'WARNING'}, message)
+        return ok
 
     # ---- 提交与退出 ----
 

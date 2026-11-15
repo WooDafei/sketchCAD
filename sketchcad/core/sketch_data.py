@@ -89,11 +89,34 @@ class SketchData:
 
         返回是否弹出。多笔划下新笔划起点不成段，撤销起点时
         不能误删上一笔划的段，故按终点坐标精确匹配。
+        弹段时级联清理指向该实体的约束——Phase 2 起实体可能携带
+        coincident / horizontal / vertical 等约束，悬空 target 会让
+        求解器与 DOF 分析直接报错。
         """
         if self.entities and self.entities[-1]["type"] == "line":
             p2 = self.entities[-1]["p2"]
             if (round(p2[0], 6), round(p2[1], 6)) == (round(p[0], 6), round(p[1], 6)):
+                eid = self.entities[-1]["id"]
                 self.entities.pop()
+                self.remove_constraints_for_entity(eid)
+                return True
+        return False
+
+    def remove_constraints_for_entity(self, eid):
+        """删除所有 target 引用 eid 的约束，返回删除数量。"""
+        before = len(self.constraints)
+        self.constraints = [
+            c for c in self.constraints
+            if eid not in (c.get("targets") or [])
+        ]
+        return before - len(self.constraints)
+
+    def remove_entity_and_constraints(self, eid):
+        """删除实体及其关联约束（编辑工具与撤销共用的级联语义）。"""
+        self.remove_constraints_for_entity(eid)
+        for i, e in enumerate(self.entities):
+            if e["id"] == eid:
+                self.entities.pop(i)
                 return True
         return False
 
