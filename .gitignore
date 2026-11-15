@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+archive/
+.idea/
+.arts/
+.codeartsdoer/
+.pytest_cache/

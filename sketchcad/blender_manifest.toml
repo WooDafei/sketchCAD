@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+
+id = "sketchcad"
+version = "0.1.0"
+name = "SketchCAD"
+tagline = "Face-driven sketching with persistent datum planes"
+maintainer = "autoprogram"
+type = "add-on"
+blender_version_min = "5.3.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
