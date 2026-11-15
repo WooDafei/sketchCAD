@@ -66,6 +66,7 @@ _MODULES = [
     "sketchcad.manager",
     "sketchcad.snapping.snap",
     "sketchcad.gpu.draw_2d",
+    "sketchcad.operators.delete_sketch",
     "sketchcad.operators.face_sketch",
     "sketchcad",
 ]

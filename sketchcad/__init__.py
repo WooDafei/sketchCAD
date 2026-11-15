@@ -5,6 +5,7 @@
 
 import bpy
 
+from .operators.delete_sketch import SKETCH_OT_delete_sketch
 from .operators.face_sketch import SKETCH_OT_face_driven_sketch
 
 addon_keymaps = []
@@ -12,6 +13,7 @@ addon_keymaps = []
 
 def register():
     bpy.utils.register_class(SKETCH_OT_face_driven_sketch)
+    bpy.utils.register_class(SKETCH_OT_delete_sketch)
 
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon
@@ -28,3 +30,4 @@ def unregister():
         km.keymap_items.remove(kmi)
     addon_keymaps.clear()
     bpy.utils.unregister_class(SKETCH_OT_face_driven_sketch)
+    bpy.utils.unregister_class(SKETCH_OT_delete_sketch)

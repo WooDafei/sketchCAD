@@ -58,6 +58,7 @@ sketchcad/
 - **独立对象化**：每个草图对应一个容器对象，几何真相存储在该对象名为 `SketchCAD_Data` 的自定义属性中，内容为**带 `version` 字段的 JSON**（schema 见 §3）。
 - **层级与命名**：所有草图自动归入 `SketchCAD_Collection` 集合；命名规则为 `Sketch_NNN`（自动递增序号，用户可改语义名）。不使用 face id 命名（索引不稳定），宿主面信息存于 JSON 的 `host` 字段。
 - **状态控制**：管理器中一键隐藏/显示特定草图；支持"断开关联（Break Link）"——**语义定义**：清除宿主对象关联，但 JSON 中的约束与尺寸标注**全部保留、求解器继续生效**，草图变为纯 2D 参数化对象。
+- **删除草图**：`sketch.delete_sketch` operator（F3 搜索 "Delete SketchCAD Sketch"，作用于选中的草图容器）删除容器与 JSON；**明确不碰 mesh 中已提交的几何**——提交物在退出时已归属建模资产（所有权边界见 §9）。宿主面被删除后旧草图成为孤儿（快照永不匹配），可通过该命令清理。
 - **最小管理前移**：Collection 创建、命名、重进对齐等最小管理能力随 Phase 0 落地，而非等到后期。
 
 ## 3. 草图数据模型（Sketch Data Model）

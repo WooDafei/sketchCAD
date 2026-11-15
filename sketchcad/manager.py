@@ -64,6 +64,19 @@ def find_matching_sketch(host_name, center_w, normal_w):
     return None, None
 
 
+def count_sketches_for_host(host_name):
+    """统计某宿主对象名下的草图数量（含快照已失效的孤儿草图）。"""
+    col = bpy.data.collections.get(COLLECTION_NAME)
+    if col is None:
+        return 0
+    n = 0
+    for obj in col.objects:
+        data = skd.load_from_object(obj)
+        if data is not None and (data.host or {}).get("object") == host_name:
+            n += 1
+    return n
+
+
 def create_container(context, sketch):
     """创建 Sketch_NNN 容器 EMPTY（本地轴对齐基准面坐标系）并写入 JSON。"""
     col = ensure_collection(context)

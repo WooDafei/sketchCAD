@@ -82,6 +82,16 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                 },
             )
             container_name = None
+            # S1 孤儿提示：宿主有历史草图但当前面不匹配（原基准面可能已被删改）
+            existing = manager.count_sketches_for_host(obj.name)
+            if existing:
+                self.report({'WARNING'},
+                            f"宿主 {obj.name} 已有 {existing} 条草图但当前面"
+                            "不匹配任何快照（原基准面可能已被删除/改动）；"
+                            "已新建草图，旧草图可 F3 搜索 "
+                            "\"Delete SketchCAD Sketch\" 清理")
+            else:
+                self.report({'INFO'}, "新建草图")
 
         state.reset()
         state.active = True
