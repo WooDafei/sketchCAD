@@ -70,3 +70,66 @@ def test_pick_endpoint_outside_tol():
 def test_pick_endpoint_boundary_inclusive():
     ents = [line(1, (0, 0), (3, 0))]
     assert picking.pick_endpoint((3.0, 0.5), ents, 0.5) == (1, 1)
+
+def circle(eid, center, radius):
+    return {"id": eid, "type": "circle",
+            "center": list(center), "radius": radius}
+
+
+def arc(eid, center, radius, a1, a2):
+    return {"id": eid, "type": "arc", "center": list(center),
+            "radius": radius, "a1": a1, "a2": a2}
+
+
+def test_pick_entity_circle_radial_distance():
+    ents = [circle(1, (0, 0), 3.0)]
+    # 圆周上：|4 - 3| = 1（径向距离，非到圆心距离）
+    assert picking.pick_entity((4, 0), ents, 1.0) == 1
+    assert picking.pick_entity((4.0, 0.0), ents, 0.9) is None
+
+
+def test_pick_entity_circle_nearest_wins():
+    ents = [circle(1, (0, 0), 3.0), circle(2, (8, 0), 3.0)]
+    # 点 (4, 0)：距圆 1 圆周 1.0，距圆 2 圆周 1.0 → 先遍历者命中
+    assert picking.pick_entity((4, 0), ents, 1.5) == 1
+    # 点 (4.5, 0)：距圆 2 圆周 0.5 → 命中圆 2
+    assert picking.pick_entity((4.5, 0), ents, 1.5) == 2
+
+
+def test_pick_entity_arc_inside_sweep():
+    import math
+    ents = [arc(1, (0, 0), 2.0, 0.0, math.pi)]
+    # 点 (0, 3)：角度 π/2 在扫角 [0, π] 内，距离 |3 - 2| = 1
+    assert picking.pick_entity((0, 3), ents, 1.0) == 1
+
+
+def test_pick_entity_arc_outside_sweep_takes_endpoint():
+    import math
+    ents = [arc(1, (0, 0), 2.0, 0.0, math.pi)]
+    # 点 (3, -0.5)：角度 < 0 不在扫角内 → 取较近端点 (2, 0) 的距离
+    d = picking.point_segment_distance((3, -0.5), (2, 0), (2, 0))
+    assert abs(d - 1.118033988749895) < 1e-9  # sqrt(1 + 0.25)
+    assert picking.pick_entity((3, -0.5), ents, 1.2) == 1
+    assert picking.pick_entity((3, -0.5), ents, 1.0) is None
+
+
+def test_pick_endpoint_arc_endpoints():
+    import math
+    ents = [arc(1, (0, 0), 2.0, 0.0, math.pi)]
+    # a1 端点 (2, 0) → (1, 0)；a2 端点 (-2, 0) → (1, 1)
+    assert picking.pick_endpoint((2.1, 0.1), ents, 0.5) == (1, 0)
+    assert picking.pick_endpoint((-2.1, -0.1), ents, 0.5) == (1, 1)
+
+
+def test_pick_endpoint_circle_center_pos2():
+    ents = [circle(1, (5, 5), 3.0)]
+    # 圆心命中 pos=2（POS_CENTER）；圆周附近不是端点
+    assert picking.pick_endpoint((5.2, 4.9), ents, 0.5) == (1, 2)
+    assert picking.pick_endpoint((8.0, 5.0), ents, 0.5) is None
+
+
+def test_pick_endpoint_line_and_arc_shared_point():
+    import math
+    ents = [line(1, (0, 0), (4, 0)), arc(2, (2, 0), 2.0, 0.0, math.pi)]
+    # 共享端点 (4, 0)：线 1 p2 与弧 2 a1 端 → 先遍历者命中
+    assert picking.pick_endpoint((4.05, 0.05), ents, 0.5) == (1, 1)

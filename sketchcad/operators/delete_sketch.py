@@ -10,6 +10,7 @@
 
 import bpy
 
+from .. import manager
 from ..core import sketch_data as skd
 from ..core.state import state
 
@@ -24,18 +25,24 @@ class SKETCH_OT_delete_sketch(bpy.types.Operator):
     bl_label = "Delete SketchCAD Sketch"
     bl_options = {'REGISTER', 'UNDO'}
 
+    # 按名删除（N-Panel 管理列表按钮）；留空时用当前活动对象（F3 搜索路径）
+    name: bpy.props.StringProperty()
+
     @classmethod
     def poll(cls, context):
+        # poll 为类方法拿不到实例属性 name：仅做静态放行，目标校验
+        # 与错误提示在 execute 内处理（与 n_panel 约束 operator 同模式）
         obj = context.active_object
-        if not _is_sketch_container(obj):
+        if state.active and obj is not None and obj.name == state.container_name:
             return False
-        # 草图会话进行中，禁止删除当前会话容器
-        if state.active and obj.name == state.container_name:
-            return False
-        return True
+        if _is_sketch_container(obj):
+            return True
+        col = bpy.data.collections.get(manager.COLLECTION_NAME)
+        return bool(col and col.objects)
 
     def execute(self, context):
-        obj = context.active_object
+        obj = (bpy.data.objects.get(self.name) if self.name
+               else context.active_object)
         if not _is_sketch_container(obj):
             self.report({'WARNING'}, "当前活动对象不是 SketchCAD 草图容器")
             return {'CANCELLED'}
@@ -48,6 +55,7 @@ class SKETCH_OT_delete_sketch(bpy.types.Operator):
         name = obj.name
 
         bpy.data.objects.remove(obj, do_unlink=True)
+        manager.prune_collection()  # 最后一条草图被删后不留空集合
         self.report({'INFO'},
                     f"已删除草图 {name}（{seg_count} 条线段的数据）；"
                     "mesh 中已提交的几何不受影响")

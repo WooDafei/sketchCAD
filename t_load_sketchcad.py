@@ -62,6 +62,7 @@ if _pkg_parent not in sys.path:
 _MODULES = [
     "sketchcad.core.state",
     "sketchcad.core.datum",
+    "sketchcad.core.geom",
     "sketchcad.core.sketch_data",
     "sketchcad.solver.params",
     "sketchcad.solver.constraints",
@@ -72,6 +73,8 @@ _MODULES = [
     "sketchcad.drawing.picking",
     "sketchcad.manager",
     "sketchcad.snapping.snap",
+    "sketchcad.editing.commit",
+    "sketchcad.editing.offset",
     "sketchcad.gpu.draw_2d",
     "sketchcad.ui.n_panel",
     "sketchcad.operators.delete_sketch",

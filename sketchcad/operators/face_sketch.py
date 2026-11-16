@@ -1,4 +1,4 @@
-"""面驱动草图 Modal Operator（Phase 0 + Phase 1）。
+"""面驱动草图 Modal Operator（Phase 0-3）。
 
 修复要点：
 - 视图对齐改用 normal.to_track_quat('Z', 'Y')（原实现旋转矩阵存在
@@ -6,12 +6,46 @@
 - 基准面坐标系持久化 + 宿主面快照匹配（重进续画，坐标系不再漂移）；
 - 法线变换使用逆转置矩阵，兼容宿主对象非均匀缩放；
 - 视图导航事件 PASS_THROUGH 交给 Blender 默认处理；
-- 右键 / Ctrl+Z 撤销上一点，ESC 提交退出；
 - 折线以双击左键或 Enter 结束（末点捕捉回起点时自然闭合轮廓），
   结束后可另起新折线，数据层按独立 line 段存储。
+
+Phase 3：
+- select 模式编辑工具：T 修剪（点击侧裁除）、E 延伸（两段式：选线→
+  预览→第二击定终点），ESC/T/E 再按退出工具；
+- §8 自管撤销升级为完整快照栈（几何修改前 push），右键/Ctrl+Z 撤销、
+  Ctrl+Shift+Z 重做，覆盖画线/尺寸/修剪/延伸/拖动全部会话操作；
+- N-Panel 约束列表固定高度窗口：鼠标滚轮在侧边栏上滚动浏览约束
+  （modal 拦截消费，不透传视口缩放），默认跟随最新约束。
+
+Phase 3 圆弧（混合草图）：
+- draw 模式子工具 L/C/A 切换（line/circle/arc）；圆两击（圆心→
+  半径），弧三点式（起点→弧上点→终点，geom.arc_from_3_points）；
+- select 模式选择/拖动/尺寸输入分派实体类型：circle 拖圆心
+  （pos=2）、arc 拖端点（反算角度保持半径）、数值输入对 circle/arc
+  生成 radius 约束、对 line 生成 distance 约束；
+- 提交 mesh 时 circle/arc 离散为折线段（与 GPU 预览同一密度）；
+- 替换式提交：重进修改尺寸再退出时按上一轮提交快照（容器
+  SketchCAD_Committed）替换旧轮廓边，避免双影。
+
+Phase 3 光标与圆心选择：
+- 光标跟随模式：draw 十字（作图）/ select 箭头（选择），S 键或
+  Tab 切换（cursor_modal_set 随 operator 结束自动恢复）；S 推荐
+  依据：会话 modal 拦截下编辑模式 S=缩放不透传，无实际冲突；
+- 端点/圆心点击与拖动区分：按下实际移动才 push 快照并实时求解，
+  纯点击即选中（圆心常驻标记见 gpu/draw_2d.py）。
+
+Phase 3 偏移（Offset，§6）：
+- select 模式 O 键激活：两段式（选实体 → 鼠标预览侧向/距离 →
+  再击确认）；圆/弧同心偏移（鼠标驱动半径，或数值输入偏移距离 +
+  回车确认，鼠标在圆内/外决定增减）；闭合轮廓 miter 偏移 +
+  开放链偏移（侧向=鼠标相对选中段左右侧，两端平端帽，算法见
+  editing/offset.py）；生成独立实体（不加偏移约束），混合直/弧
+  链偏移待适配。
 """
 
+import math
 import time
+from copy import deepcopy
 
 import bmesh
 
@@ -25,11 +59,16 @@ from bpy_extras.view3d_utils import (
 from mathutils.geometry import intersect_line_plane
 
 from .. import manager
+from ..core import geom
 from ..core import sketch_data as skd
 from ..core.datum import Datum
-from ..core.state import state
+from ..core.state import CONSTRAINT_VISIBLE, CONSTRAINT_WHEEL_STEP, state
 from ..drawing import auto_constraints as ac
 from ..drawing import picking
+from ..editing import commit as cmt
+from ..editing import offset as off
+from ..editing import trim_extend as te
+from ..editing.loops import detect_closed_loops
 from ..gpu.draw_2d import draw_sketch
 from ..solver import apply as solver_apply
 from ..solver import dof as solver_dof
@@ -42,12 +81,24 @@ _DIGIT_KEYS = {str(i) for i in range(10)}
 _NUMPAD_DIGIT = {f"NUMPAD_{i}": str(i) for i in range(10)}
 _PERIOD_KEYS = ('PERIOD', 'NUMPAD_PERIOD')
 
+# select 模式编辑工具快捷键（T 修剪 / E 延伸 / O 偏移）
+_TOOL_KEYS = {'T': 'trim', 'E': 'extend', 'O': 'offset'}
+
+# draw 模式子工具快捷键（L 直线 / C 圆 / A 三点弧）
+_DRAW_TOOL_KEYS = {'L': 'line', 'C': 'circle', 'A': 'arc'}
+
+# 圆/弧绘制的最小尺寸（世界单位），低于视为误击
+_MIN_RADIUS = 1e-4
+
 # 草图会话中放行给 N-Panel（UI region）的鼠标事件（约束管理/阈值配置）
-_UI_PASS_EVENTS = {'LEFTMOUSE', 'RIGHTMOUSE', 'MIDDLEMOUSE', 'MOUSEMOVE',
-                   'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}
+# ——滚轮不在放行之列：被单独拦截用于约束列表滚动（见 modal 分支）
+_UI_PASS_EVENTS = {'LEFTMOUSE', 'RIGHTMOUSE', 'MIDDLEMOUSE', 'MOUSEMOVE'}
 
 # 拖动实时求解的节流间隔（~60Hz；20 实体规模单次求解 ~15ms，见 bench_20x30）
 _DRAG_SOLVE_INTERVAL = 1.0 / 60.0
+
+# §8 快照栈深度上限（防长时间会话内存膨胀）
+_UNDO_LIMIT = 100
 
 
 class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
@@ -124,11 +175,17 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         state.draw_handler = bpy.types.SpaceView3D.draw_handler_add(
             draw_sketch, (), 'WINDOW', 'POST_VIEW')
 
+        # 进入即作图模式：十字光标（cursor_modal_set 随 operator
+        # 结束自动恢复进入前的光标状态）
+        if context.window is not None:
+            context.window.cursor_modal_set('CROSSHAIR')
+
         context.window_manager.modal_handler_add(self)
         self.report({'INFO'},
                     "SketchCAD 草图模式 | 画线: 左键加点, 双击/Enter 结束"
-                    " | Tab 选择模式(点线+输数值+回车定尺寸)"
-                    " | 右键/Ctrl+Z 撤销 | ESC 提交退出")
+                    " | L/C/A 切直线/圆/弧 | Tab 选择模式(输数值+回车"
+                    "定尺寸, T 修剪, E 延伸) | 右键/Ctrl+Z 撤销, "
+                    "Ctrl+Shift+Z 重做 | ESC 提交退出")
         return {'RUNNING_MODAL'}
 
     def _align_view(self, context, datum):
@@ -159,7 +216,14 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             return {'FINISHED'}
         context.area.tag_redraw()
 
-        # N-Panel（UI region）事件放行：草图进行中可用侧边栏
+        # 滚轮在 N-Panel 上：滚动约束列表（步长 CONSTRAINT_WHEEL_STEP
+        # 行），消费事件避免透传视口缩放
+        if (event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}
+                and self._cursor_in_ui_region(context, event)):
+            self._scroll_constraints(event.type == 'WHEELUPMOUSE')
+            return {'RUNNING_MODAL'}
+
+        # N-Panel（UI region）其余事件放行：草图进行中可用侧边栏
         if (event.type in _UI_PASS_EVENTS
                 and self._cursor_in_ui_region(context, event)):
             return {'PASS_THROUGH'}
@@ -168,54 +232,117 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             self._update_mouse(context, event)
             if state.dragging is not None:
                 self._drag_update()
+            if state.extend_pending is not None:
+                self._update_extend_preview()
+            if state.offset_pending is not None:
+                self._update_offset_preview()
             return {'RUNNING_MODAL'}
 
         if event.type == 'TAB' and event.value == 'PRESS':
-            self._toggle_mode()
+            self._toggle_mode(context)
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'S' and event.value == 'PRESS':
+            # S 与 Tab 等价：draw（十字光标）↔ select（箭头光标）。
+            # 冲突排查：会话 modal 拦截一切非放行键（仅滚轮/中键透传），
+            # Blender 编辑模式 S=缩放在会话内本就不生效，无实际冲突
+            self._toggle_mode(context)
+            return {'RUNNING_MODAL'}
+
+        if (event.value == 'PRESS' and state.mode == "draw"
+                and event.type in _DRAW_TOOL_KEYS):
+            self._set_draw_tool(_DRAW_TOOL_KEYS[event.type])
             return {'RUNNING_MODAL'}
 
         if (event.value == 'PRESS' and state.mode == "select"
-                and state.selected_entity is not None):
+                and (state.offset_pending is not None
+                     or (state.tool is None
+                         and state.selected_entity is not None))):
+            # 数值输入：选中实体定尺寸，或偏移预览中输入偏移距离
             if self._on_input_key(event.type):
                 return {'RUNNING_MODAL'}
+
+        if (event.value == 'PRESS' and state.mode == "select"
+                and event.type in _TOOL_KEYS):
+            self._toggle_tool(_TOOL_KEYS[event.type])
+            return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             if state.mouse_2d is not None:
                 if state.mode == "select":
-                    self._press_select(context, state.mouse_2d)
-                elif not state.stroke_open:
-                    # 新折线起点：只记录点，不与历史末点拼段
-                    state.points_2d.append(state.mouse_2d)
-                    state.stroke_open = True
+                    if state.tool == 'trim':
+                        self._apply_trim(context)
+                    elif state.tool == 'extend':
+                        self._apply_extend(context)
+                    elif state.tool == 'offset':
+                        self._apply_offset(context)
+                    else:
+                        self._press_select(context, state.mouse_2d)
                 else:
-                    self._confirm_segment(context, state.mouse_2d)
+                    self._press_draw(context, state.mouse_2d)
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
             if state.dragging is not None:
+                dragged = state.drag_undo_pushed
                 state.dragging = None
                 self._refresh_dof()
-                self.report({'INFO'}, "拖动求解结束")
+                if dragged:
+                    self.report({'INFO'}, "拖动求解结束")
+                else:
+                    # 纯点击命中（未拖动）：端点/圆心即选中
+                    self.report({'INFO'},
+                                f"已选中实体 #{state.selected_entity}"
+                                "（按住拖动可实时求解）")
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'DOUBLE_CLICK':
             # 双击：结束当前折线；若末点捕捉回起点则已自然闭合轮廓
-            state.stroke_open = False
+            if state.mode == "draw" and state.draw_tool == "line":
+                state.stroke_open = False
             return {'RUNNING_MODAL'}
 
         if event.type == 'RET' and event.value == 'PRESS':
             if state.mode == "select":
-                self._apply_dimension()
-            else:
+                if (state.tool == 'offset'
+                        and state.offset_pending is not None):
+                    # 数值确认：按输入距离偏移（侧向用当前鼠标位置）
+                    self._confirm_offset()
+                    state.input_buffer = ""
+                else:
+                    self._apply_dimension()
+            elif state.draw_tool == "line":
                 state.stroke_open = False
+            return {'RUNNING_MODAL'}
+
+        if (event.type == 'Z' and event.ctrl and event.shift
+                and event.value == 'PRESS'):
+            self._redo()
             return {'RUNNING_MODAL'}
 
         if ((event.type == 'RIGHTMOUSE' or (event.type == 'Z' and event.ctrl))
                 and event.value == 'PRESS'):
-            self._undo_point()
+            self._undo()
             return {'RUNNING_MODAL'}
 
         if event.type == 'ESC' and event.value == 'PRESS':
+            if state.tool is not None:
+                # 延伸/偏移未确认时先取消选择，再按才退出工具
+                if state.extend_pending is not None:
+                    state.extend_pending = None
+                    state.extend_preview = None
+                elif state.offset_pending is not None:
+                    state.offset_pending = None
+                    state.offset_preview = None
+                else:
+                    state.tool = None
+                return {'RUNNING_MODAL'}
+            if state.mode == "draw" and (
+                    state.circle_center is not None
+                    or state.arc_p1 is not None or state.arc_p2 is not None):
+                # 圆/弧绘制进行中：先取消未完成的绘制，再按才退出草图
+                self._cancel_curve_pending()
+                return {'RUNNING_MODAL'}
             if state.mode == "select" and (
                     state.selected_entity is not None or state.input_buffer):
                 # 先清选中/取消输入，再按一次 ESC 才退出草图
@@ -243,23 +370,31 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         state.snap = None
         if hit is None:
             return
-        snap_result = self._find_snap(context, event)
+        raw_2d = state.datum.to_2d(hit)
+        snap_result = self._find_snap(context, event, raw_2d)
         if snap_result is not None:
             state.snap = snap_result
             state.mouse_2d = snap_result[1]
         else:
-            state.mouse_2d = state.datum.to_2d(hit)
+            state.mouse_2d = raw_2d
 
-    def _find_snap(self, context, event):
-        """像素级最近捕捉特征；端点优先于中点。返回 (kind, (u, v)) 或 None。"""
+    def _find_snap(self, context, event, raw_2d):
+        """像素级最近捕捉特征；端点 > 中点/线上点。返回 (kind, (u, v)) 或 None。
+
+        线上点候选（鼠标在既有线上的垂足）依赖鼠标位置，由 raw_2d
+        （未吸附的基准面投影点）驱动生成。
+        """
         region = context.region
         rv3d = context.region_data
         if region is None or rv3d is None:
             return None
         mx, my = event.mouse_region_x, event.mouse_region_y
         d = state.datum
+        tol_world = (snap.SNAP_PIXEL_TOLERANCE
+                     * self._world_per_pixel(context))
         best = None  # (priority, dist, kind, (u, v))
-        for u, v, kind in snap.collect_candidates(state.sketch.entities):
+        for u, v, kind in snap.collect_candidates(
+                state.sketch.entities, mouse_2d=raw_2d, tol=tol_world):
             px = location_3d_to_region_2d(region, rv3d, d.to_world(u, v))
             if px is None:
                 continue
@@ -274,28 +409,322 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             return None
         return best[2], best[3]
 
-    def _undo_point(self):
-        if not state.points_2d:
-            return
-        popped = state.points_2d.pop()
-        # 仅当最后一条段的终点恰为被弹点时才撤销该段（跨笔划安全）；
-        # 弹段在 sketch_data 内级联清理其自动约束
-        state.sketch.pop_line_ending_at(popped)
-        if not state.points_2d:
-            state.stroke_open = False
-        if (state.selected_entity is not None
-                and all(e["id"] != state.selected_entity
-                        for e in state.sketch.entities)):
-            # 选中的段已被撤销，清空选择态防悬空
-            state.selected_entity = None
-            state.input_buffer = ""
+    # ---- §8 自管撤销：完整快照栈（几何修改前 push）----
+
+    def _snapshot_now(self):
+        return {
+            "entities": deepcopy(state.sketch.entities),
+            "constraints": deepcopy(state.sketch.constraints),
+            "points_2d": list(state.points_2d),
+            "stroke_open": state.stroke_open,
+        }
+
+    def _push_undo(self):
+        state.undo_stack.append(self._snapshot_now())
+        if len(state.undo_stack) > _UNDO_LIMIT:
+            state.undo_stack.pop(0)
+        state.redo_stack.clear()
+
+    def _restore(self, snap):
+        state.sketch.entities = deepcopy(snap["entities"])
+        state.sketch.constraints = deepcopy(snap["constraints"])
+        state.points_2d = list(snap["points_2d"])
+        state.stroke_open = snap["stroke_open"]
+        state.selected_entity = None
+        state.input_buffer = ""
+        state.dragging = None
+        # 撤销/重做后清除未完成的圆/弧绘制状态（快照不含进行中预览）
+        self._cancel_curve_pending()
         self._refresh_dof()
+
+    def _undo(self):
+        if not state.undo_stack:
+            return
+        state.redo_stack.append(self._snapshot_now())
+        self._restore(state.undo_stack.pop())
+
+    def _redo(self):
+        if not state.redo_stack:
+            return
+        state.undo_stack.append(self._snapshot_now())
+        self._restore(state.redo_stack.pop())
+
+    # ---- select 模式编辑工具（Trim/Extend，SketchCAD.md §6）----
+
+    def _toggle_tool(self, tool):
+        state.tool = None if state.tool == tool else tool
+        state.selected_entity = None
+        state.input_buffer = ""
+        state.extend_pending = None
+        state.extend_preview = None
+        state.offset_pending = None
+        state.offset_preview = None
+        if state.tool is None:
+            self.report({'INFO'}, "SketchCAD：编辑工具已退出")
+        elif state.tool == 'trim':
+            self.report({'INFO'},
+                        "SketchCAD 修剪：点击线段要移除的部分"
+                        "（裁除点击侧，保留另一侧）")
+        elif state.tool == 'extend':
+            self.report({'INFO'},
+                        "SketchCAD 延伸：点击选中要延伸的线，移动鼠标"
+                        "预览，再次点击确认终点（ESC 取消）")
+        else:
+            self.report({'INFO'},
+                        "SketchCAD 偏移：点击选中线段（须属闭合轮廓）"
+                        "或圆/弧，移动鼠标预览，再次点击确认"
+                        "（ESC 取消选择）")
+
+    def _pick_for_tool(self, context):
+        tol = picking.SELECT_PIXEL_TOL * self._world_per_pixel(context)
+        return picking.pick_segment(
+            state.mouse_2d, state.sketch.entities, tol)
+
+    def _entity_by_id(self, eid):
+        for e in state.sketch.entities:
+            if e.get("id") == eid:
+                return e
+        return None
+
+    def _apply_trim(self, context):
+        eid = self._pick_for_tool(context)
+        if eid is None:
+            return
+        ok, *rest = te.trim_line(state.sketch.entities, eid, state.mouse_2d)
+        if not ok:
+            reason = rest[0]
+            if reason == "no-intersection":
+                self.report({'WARNING'}, "修剪：该段无内部交点可裁")
+            elif reason == "removed":
+                self._push_undo()
+                state.sketch.remove_entity_and_constraints(eid)
+                self._refresh_dof()
+                self.report({'INFO'}, "修剪：保留侧退化，整段已移除")
+            return
+        changed_pos, new_p1, new_p2 = rest
+        self._push_undo()
+        ent = self._entity_by_id(eid)
+        if ent is not None:
+            ent["p1"], ent["p2"] = new_p1, new_p2
+        # 被改变端的原位置固接失效，级联清理；长度语义约束同步移除
+        state.sketch.remove_constraints_for_endpoint(eid, changed_pos)
+        state.sketch.remove_constraints_for_entity(eid, "distance")
+        self._refresh_dof()
+        self.report({'INFO'}, "修剪完成（点击侧已裁除）")
+
+    def _apply_extend(self, context):
+        """两段式延伸：第一击选中线段，移动鼠标预览，第二击确认终点。"""
+        if state.extend_pending is None:
+            eid = self._pick_for_tool(context)
+            if eid is None:
+                return
+            state.extend_pending = eid
+            self._update_extend_preview()
+            self.report({'INFO'},
+                        f"延伸：已选中线段 #{eid}，移动鼠标预览，"
+                        "再次点击确认终点（ESC 取消选择）")
+            return
+        eid = state.extend_pending
+        ent = self._entity_by_id(eid)
+        if ent is None or ent.get("type") != "line":
+            state.extend_pending = None
+            state.extend_preview = None
+            return
+        preview = state.extend_preview
+        if preview is None:
+            self.report({'WARNING'},
+                        "延伸：请在线段延长线一侧点击确认终点")
+            return
+        pos, _from_pt, to_pt = preview
+        self._push_undo()
+        if pos == 0:
+            ent["p1"] = [to_pt[0], to_pt[1]]
+        else:
+            ent["p2"] = [to_pt[0], to_pt[1]]
+        # 被改变端的原位置固接失效，级联清理；长度语义约束同步移除
+        state.sketch.remove_constraints_for_endpoint(eid, pos)
+        state.sketch.remove_constraints_for_entity(eid, "distance")
+        # 终点命中其他实体端点时自动固接（与绘制 coincident 语义一致）
+        hit = ac.find_endpoint_hit(to_pt, state.sketch.entities,
+                                   exclude_id=eid)
+        if hit is not None:
+            state.sketch.add_constraint(
+                ac.COINCIDENT, [eid, hit[0]], endpoints=[pos, hit[1]])
+        state.extend_pending = None
+        state.extend_preview = None
+        self._refresh_dof()
+        self.report({'INFO'}, "延伸完成")
+
+    def _extend_preview_result(self, ent):
+        """延伸预览计算：返回 (pos, from_pt, to_pt) 或 None。
+
+        延伸端取距鼠标较近的端点；终点 = 鼠标在该端延长方向上的
+        投影（投影落在线段内部时延伸无意义，返回 None）。
+        """
+        m = state.mouse_2d
+        if m is None:
+            return None
+        p1, p2 = ent["p1"], ent["p2"]
+        t_m = te.project_param(p1, p2, m)
+        if t_m > 1.0 + te.PARAM_EPS:
+            pos = 1
+        elif t_m < -te.PARAM_EPS:
+            pos = 0
+        else:
+            return None
+        pt = te.point_at(p1, p2, t_m)
+        from_pt = (p1[0], p1[1]) if pos == 0 else (p2[0], p2[1])
+        return pos, from_pt, (pt[0], pt[1])
+
+    def _update_extend_preview(self):
+        ent = self._entity_by_id(state.extend_pending)
+        if ent is None or ent.get("type") != "line":
+            state.extend_pending = None
+            state.extend_preview = None
+            return
+        state.extend_preview = self._extend_preview_result(ent)
+
+    # ---- Offset 偏移（SketchCAD.md §6，editing/offset.py 算法）----
+
+    def _find_loop_for(self, eid):
+        """查找包含实体 eid 的闭合轮廓（state.loops 缓存）。"""
+        for loop in state.loops:
+            if eid in loop:
+                return loop
+        return None
+
+    def _update_offset_preview(self):
+        """偏移预览：侧向由鼠标位置决定；距离优先取数值输入缓冲
+        （回车确认），否则鼠标驱动（圆/弧半径=鼠标到圆心距离）。
+        """
+        ent = self._entity_by_id(state.offset_pending)
+        if ent is None:
+            state.offset_pending = None
+            state.offset_preview = None
+            return
+        m = state.mouse_2d
+        if m is None:
+            state.offset_preview = None
+            return
+        # 数值输入缓冲优先（offset pending 状态下输入数字 + 回车确认）
+        buffered = None
+        if state.input_buffer:
+            try:
+                v = float(state.input_buffer)
+                if v > 0:
+                    buffered = v
+            except ValueError:
+                pass
+        t = ent.get("type")
+        if t == "circle":
+            c, r = ent["center"], ent["radius"]
+            if buffered is not None:
+                # 数值模式：输入为偏移距离，鼠标在圆外/内决定增减
+                outward = math.hypot(m[0] - c[0], m[1] - c[1]) >= r
+                new_r = off.offset_circle_by_distance(c, r, buffered,
+                                                      outward)
+            else:
+                new_r = off.offset_circle(c, r, m)
+            state.offset_preview = (
+                {"kind": "circle", "center": list(c), "radius": new_r}
+                if new_r is not None else None)
+        elif t == "arc":
+            c, r = ent["center"], ent["radius"]
+            if buffered is not None:
+                outward = math.hypot(m[0] - c[0], m[1] - c[1]) >= r
+                res = off.offset_arc_by_distance(c, r, ent["a1"],
+                                                 ent["a2"], buffered,
+                                                 outward)
+            else:
+                res = off.offset_arc(c, r, ent["a1"], ent["a2"], m)
+            state.offset_preview = (
+                {"kind": "arc", "center": list(c), "radius": res[0],
+                 "a1": res[1], "a2": res[2]}
+                if res is not None else None)
+        else:  # line：闭合轮廓 → profile；开放链 → open chain
+            by_id = {e["id"]: e for e in state.sketch.entities}
+            loop = self._find_loop_for(state.offset_pending)
+            if loop is not None:
+                dist = (buffered if buffered is not None
+                        else off.distance_to_segment(m, ent["p1"],
+                                                     ent["p2"]))
+                chain = off.orient_closed_chain(by_id, loop)
+                segs = off.offset_profile(chain, dist, m)
+                state.offset_preview = (
+                    {"kind": "profile", "segments": segs}
+                    if segs else None)
+                return
+            chain = off.collect_open_chain(by_id, state.offset_pending)
+            if chain is None:
+                state.offset_preview = None
+                return
+            dist = (buffered if buffered is not None
+                    else off.distance_to_segment(m, ent["p1"], ent["p2"]))
+            side_left = off.chain_side_for_entity(chain, ent, m)
+            segs = off.offset_open_chain(chain, dist, side_left)
+            state.offset_preview = (
+                {"kind": "profile", "segments": segs} if segs else None)
+
+    def _apply_offset(self, context):
+        """两段式偏移：第一击选实体，移动鼠标预览，第二击确认生成。
+
+        线段优先按闭合轮廓偏移，不属于轮廓时按所属开放链偏移
+        （2026-11-16 实测反馈：未闭合线段也要能偏移）；混合链
+        不支持，圆/弧可单独偏移；生成独立实体（MVP 不加偏移约束）。
+        """
+        if state.offset_pending is None:
+            eid = picking.pick_entity(
+                state.mouse_2d, state.sketch.entities,
+                picking.SELECT_PIXEL_TOL * self._world_per_pixel(context))
+            if eid is None:
+                return
+            ent = self._entity_by_id(eid)
+            if (ent.get("type") == "line"
+                    and self._find_loop_for(eid) is None):
+                by_id = {e["id"]: e for e in state.sketch.entities}
+                if off.collect_open_chain(by_id, eid) is None:
+                    self.report({'WARNING'},
+                                "偏移：该线段所属链含圆弧或存在分叉"
+                                "（暂不支持），圆/弧可单独偏移")
+                    return
+            state.offset_pending = eid
+            self._update_offset_preview()
+            self.report({'INFO'},
+                        "偏移：移动鼠标预览，或输入数值后回车定距离，"
+                        "再次点击确认（ESC 取消选择）")
+            return
+        self._confirm_offset()
+
+    def _confirm_offset(self):
+        """以当前预览生成偏移实体（第二击与数值回车共用）。"""
+        preview = state.offset_preview
+        if preview is None:
+            self.report({'WARNING'},
+                        "偏移：当前位置无法生成有效偏移"
+                        "（半径过小或有效段不足），换个位置再确认")
+            return
+        self._push_undo()
+        sketch = state.sketch
+        if preview["kind"] == "circle":
+            sketch.add_circle(preview["center"], preview["radius"])
+        elif preview["kind"] == "arc":
+            sketch.add_arc(preview["center"], preview["radius"],
+                           preview["a1"], preview["a2"])
+        else:
+            for a, b in preview["segments"]:
+                sketch.add_line(a, b)
+        state.offset_pending = None
+        state.offset_preview = None
+        self._refresh_dof()
+        self.report({'INFO'}, "偏移完成（独立实体，未加偏移约束）")
 
     def _confirm_segment(self, context, p2):
         """确认连续段：推断水平/垂直并吸附，写入实体与自动约束。
 
         端点与既有实体端点重合（捕捉对齐 / 折线连续 / 闭合轮廓）时
-        写入 coincident 固接，端点定位沿用 round6 语义。
+        写入 coincident 固接，端点定位沿用 round6 语义；端点落在既有
+        线内部（未命中端点）时吸附到垂足并写入 point_on_line 关联
+        ——新画线与旧草图线的交点关联由此建立，拖动/求解持续生效。
         """
         prev = state.points_2d[-1]
         same = (
@@ -303,10 +732,17 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             round(p2[0], 6), round(p2[1], 6))
         if same:
             return
+        self._push_undo()
         tol = state.hv_pixel_tol * self._world_per_pixel(context)
         ctype = ac.classify_segment(prev, p2, tol)
         if ctype is not None:
             _, p2 = ac.snapped_segment(prev, p2, ctype)
+        # 端点落在既有线内部 → 吸附到垂足（关联约束在实体写入后登记）
+        line_hit = ac.find_line_hit(
+            p2, state.sketch.entities,
+            snap.SNAP_PIXEL_TOLERANCE * self._world_per_pixel(context))
+        if line_hit is not None:
+            p2 = line_hit[1]
         state.points_2d.append(p2)
 
         sketch = state.sketch
@@ -319,15 +755,24 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                 sketch.add_constraint(
                     ac.COINCIDENT, [new_id, hit[0]],
                     endpoints=[new_pos, hit[1]])
+            elif new_pos == 1 and line_hit is not None:
+                sketch.add_constraint(
+                    ac.POINT_ON_LINE, [new_id, line_hit[0]],
+                    endpoints=[1, None])
         if ctype is not None:
             sketch.add_constraint(ctype, [new_id])
         self._refresh_dof()
 
     def _refresh_dof(self):
-        """实体/约束变化后刷新 DOF 报告缓存（不进 MOUSEMOVE 每帧路径）。"""
+        """实体/约束变化后刷新 DOF 报告与闭合轮廓缓存（不进拖动帧路径）。"""
         if state.sketch is not None:
             state.dof_report = solver_dof.analyze(
                 state.sketch.entities, state.sketch.constraints)
+            state.loops = detect_closed_loops(state.sketch.entities)
+            n = len(state.sketch.constraints)
+            if state.constraint_follow and n > CONSTRAINT_VISIBLE:
+                # 跟随最新约束：滚动窗口锚定底部（画线新加的始终可见）
+                state.constraint_scroll_start = n - CONSTRAINT_VISIBLE
 
     def _world_per_pixel(self, context):
         """正交正视近似换算：可视世界高度 / 视口像素高度。"""
@@ -347,44 +792,146 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                         and r.y <= event.mouse_y < r.y + r.height)
         return False
 
+    def _scroll_constraints(self, up):
+        """N-Panel 滚轮滚动约束列表（步长 CONSTRAINT_WHEEL_STEP 行）。
+
+        滚动起始索引存于会话状态（无滑块控件）；向上滚动浏览历史后
+        停止跟随最新约束，滚回底部自动恢复跟随。
+        """
+        n = len(state.sketch.constraints) if state.sketch else 0
+        if n <= CONSTRAINT_VISIBLE:
+            return
+        max_scroll = n - CONSTRAINT_VISIBLE
+        step = -CONSTRAINT_WHEEL_STEP if up else CONSTRAINT_WHEEL_STEP
+        start = max(0, min(state.constraint_scroll_start + step, max_scroll))
+        state.constraint_scroll_start = start
+        state.constraint_follow = start >= max_scroll
+
     # ---- 选择模式与尺寸驱动（SketchCAD.md §4）----
 
-    def _toggle_mode(self):
-        # 切换前结束进行中的笔划，防跨模式状态错乱
+    def _toggle_mode(self, context):
+        # 切换前结束进行中的笔划/绘制，防跨模式状态错乱
         state.stroke_open = False
+        self._cancel_curve_pending()
+        state.tool = None
+        state.extend_pending = None
+        state.extend_preview = None
+        state.offset_pending = None
+        state.offset_preview = None
         state.mode = "select" if state.mode == "draw" else "draw"
         state.selected_entity = None
         state.input_buffer = ""
         state.solve_failed = False
         state.dragging = None
+        # 光标跟随模式：draw 十字（作图）/ select 箭头（选择）
+        if context.window is not None:
+            context.window.cursor_modal_set(
+                'CROSSHAIR' if state.mode == "draw" else 'DEFAULT')
         if state.mode == "draw":
-            self.report({'INFO'}, "SketchCAD：画线模式（左键加点）")
+            self.report({'INFO'},
+                        "SketchCAD：画线模式（L 直线 / C 圆 / A 三点弧）")
         else:
             self.report({'INFO'},
-                        "SketchCAD：选择模式——点击线段选中，输入数值后"
-                        "回车定尺寸，Tab 返回画线")
+                        "SketchCAD：选择模式——点击实体选中，拖动端点/"
+                        "圆心实时求解，输入数值后回车定尺寸，Tab 返回画线")
+
+    def _set_draw_tool(self, tool):
+        state.draw_tool = tool
+        self._cancel_curve_pending()
+        state.stroke_open = False
+        names = {'line': "直线", 'circle': "圆（两击：圆心→半径）",
+                 'arc': "三点弧（起点→弧上点→终点）"}
+        self.report({'INFO'}, f"SketchCAD：{names.get(tool, tool)}工具")
+
+    def _cancel_curve_pending(self):
+        state.circle_center = None
+        state.arc_p1 = None
+        state.arc_p2 = None
+
+    def _press_draw(self, context, p):
+        """draw 模式左键按下：按子工具分派（折线/圆/三点弧）。"""
+        if state.draw_tool == "line":
+            if not state.stroke_open:
+                # 新折线起点：只记录点，不与历史末点拼段
+                state.points_2d.append(p)
+                state.stroke_open = True
+            else:
+                self._confirm_segment(context, p)
+        elif state.draw_tool == "circle":
+            self._press_circle(p)
+        elif state.draw_tool == "arc":
+            self._press_arc(p)
+
+    def _press_circle(self, p):
+        """圆两击状态机：第一击定圆心，第二击定半径并写入实体。"""
+        if state.circle_center is None:
+            state.circle_center = (p[0], p[1])
+            return
+        c = state.circle_center
+        r = ((p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2) ** 0.5
+        self._cancel_curve_pending()
+        if r < _MIN_RADIUS:
+            self.report({'WARNING'}, "圆：半径过小，已取消（重新点击圆心）")
+            return
+        self._push_undo()
+        state.sketch.add_circle(c, r)
+        self._refresh_dof()
+
+    def _press_arc(self, p):
+        """弧三点式状态机：起点 → 弧上点 → 终点（三点定圆现算）。"""
+        if state.arc_p1 is None:
+            state.arc_p1 = (p[0], p[1])
+            return
+        if state.arc_p2 is None:
+            if ((p[0] - state.arc_p1[0]) ** 2
+                    + (p[1] - state.arc_p1[1]) ** 2) ** 0.5 < _MIN_RADIUS:
+                self.report({'WARNING'}, "弧：弧上点与起点重合，重新点击")
+                return
+            state.arc_p2 = (p[0], p[1])
+            return
+        p1, p2, p3 = state.arc_p1, state.arc_p2, (p[0], p[1])
+        self._cancel_curve_pending()
+        res = geom.arc_from_3_points(p1, p2, p3)
+        if res is None:
+            self.report({'WARNING'},
+                        "弧：三点共线或重合，已取消（重新点击起点）")
+            return
+        center, r, a1, a2 = res
+        if r < _MIN_RADIUS:
+            self.report({'WARNING'}, "弧：半径过小，已取消（重新点击起点）")
+            return
+        self._push_undo()
+        state.sketch.add_arc(center, r, a1, a2)
+        self._refresh_dof()
 
     def _select_at(self, context, p):
         tol = picking.SELECT_PIXEL_TOL * self._world_per_pixel(context)
-        state.selected_entity = picking.pick_segment(
+        state.selected_entity = picking.pick_entity(
             p, state.sketch.entities, tol)
         state.input_buffer = ""
         state.solve_failed = False
 
     def _press_select(self, context, p):
-        """select 模式按下：端点命中则进入拖动求解，否则选线段。"""
+        """select 模式按下：端点/圆心命中则进入拖动求解，否则选实体。"""
         tol = picking.SELECT_PIXEL_TOL * self._world_per_pixel(context)
         hit = picking.pick_endpoint(p, state.sketch.entities, tol)
         if hit is not None:
+            # 拖动快照延迟到实际移动时 push：纯点击（端点/圆心命中）
+            # 仅选中，不污染 undo 栈；按住拖动才回退到拖动前
             state.dragging = hit
             state.selected_entity = hit[0]
             state.solve_failed = False
             state.drag_last_solve = 0.0
+            state.drag_undo_pushed = False
         else:
             self._select_at(context, p)
 
     def _drag_update(self):
-        """拖动端点实时求解（节流 ~60Hz；失败时保持上次成功几何）。"""
+        """拖动实时求解（节流 ~60Hz；失败时保持上次成功几何）。
+
+        dragging=(eid, pos)：line/arc 端点 pos 0/1（arc 端点由鼠标
+        反算角度、保持半径），circle 圆心 pos=2。
+        """
         now = time.perf_counter()
         if now - state.drag_last_solve < _DRAG_SOLVE_INTERVAL:
             return
@@ -392,13 +939,29 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         eid, pos = state.dragging
         if state.mouse_2d is None:
             return
+        x, y = state.mouse_2d
         for e in state.sketch.entities:
             if e.get("id") == eid:
-                x, y = state.mouse_2d
-                if pos == 0:
-                    e["p1"] = [x, y]
-                else:
-                    e["p2"] = [x, y]
+                # 实际移动几何前 push 快照（纯点击不进 undo 栈）
+                if not state.drag_undo_pushed:
+                    self._push_undo()
+                    state.drag_undo_pushed = True
+                t = e.get("type")
+                if t == "line":
+                    if pos == 0:
+                        e["p1"] = [x, y]
+                    else:
+                        e["p2"] = [x, y]
+                elif t == "circle" and pos == picking.POS_CENTER:
+                    e["center"] = [x, y]
+                elif t == "arc" and pos in (0, 1):
+                    # 拖弧端点：鼠标投影到圆周上反算角度（保持半径）；
+                    # 圆心/半径在端点拖动中保持不变
+                    c = e["center"]
+                    r = e["radius"]
+                    ang = math.atan2(y - c[1], x - c[0])
+                    key = "a1" if pos == 0 else "a2"
+                    e[key] = ang
                 break
         else:
             state.dragging = None  # 实体已不在（被撤销等），结束拖动
@@ -421,7 +984,11 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         return False
 
     def _apply_dimension(self):
-        """数值确认：创建/更新选中线段的 distance 约束并求解回写。"""
+        """数值确认：按选中实体类型写入尺寸约束并求解回写。
+
+        line -> distance（线长）；circle/arc -> radius（半径）。
+        选中实体上已有同类型启用约束时更新其 value（避免重复约束）。
+        """
         if state.selected_entity is None or not state.input_buffer:
             return
         try:
@@ -435,16 +1002,27 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             return
         sketch = state.sketch
         eid = state.selected_entity
+        ent = self._entity_by_id(eid)
+        etype = ent.get("type") if ent is not None else None
+        if etype == "line":
+            ctype = "distance"
+        elif etype in ("circle", "arc"):
+            ctype = "radius"
+        else:
+            state.input_buffer = ""
+            return
         existing = None
         for c in sketch.constraints:
-            if (c.get("type") == "distance" and c.get("enabled", True)
+            if (c.get("type") == ctype and c.get("enabled", True)
                     and eid in (c.get("targets") or [])):
                 existing = c
                 break
         if existing is not None:
+            self._push_undo()
             existing["value"] = value
         else:
-            sketch.add_constraint("distance", [eid], value=value)
+            self._push_undo()
+            sketch.add_constraint(ctype, [eid], value=value)
         state.input_buffer = ""
         if self._solve_and_apply():
             self.report({'INFO'}, f"尺寸已应用：{value:g}")
@@ -462,13 +1040,19 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
 
     def _finish(self, context):
         count = self._commit(context)
-        segments = len(state.sketch.entities)
+        sketch = state.sketch
+        n_line = sum(1 for e in sketch.entities if e.get("type") == "line")
+        n_curve = sum(1 for e in sketch.entities
+                      if e.get("type") in ("circle", "arc"))
         self._cleanup(context)
-        self.report({'INFO'}, f"草图完成：{count} 个点 / {segments} 条线段")
+        self.report({'INFO'},
+                    f"草图完成：{count} 个点 / {n_line} 条线段"
+                    + (f" / {n_curve} 个圆弧" if n_curve else ""))
         return {'FINISHED'}
 
     def _commit(self, context):
-        if not state.points_2d:
+        entities = state.sketch.entities
+        if not state.points_2d and not entities:
             return 0
 
         obj = context.active_object
@@ -480,37 +1064,119 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             if not manager.update_container(state.container_name, state.sketch):
                 cont = manager.create_container(context, state.sketch)
                 state.container_name = cont.name
+            else:
+                cont = bpy.data.objects.get(state.container_name)
         else:
             cont = manager.create_container(context, state.sketch)
             state.container_name = cont.name
 
-        # 2. mesh 提交：2D -> 世界 -> 宿主局部
+        # 2. mesh 提交（替换式）：重进续画后再退出时，先按上一轮提交
+        #    快照删除宿主 mesh 中的旧轮廓边，再提交当前几何——否则
+        #    尺寸修改后新边与旧边不重合，"原来的草图"会残留成双影。
+        #    旧边被建模引用（关联面）或已被手动编辑时保留并提示，
+        #    绝不触碰非本草图提交物的几何。
         bm = bmesh.from_edit_mesh(obj.data)
         mwi = obj.matrix_world.inverted()
+
+        def to_local(p):
+            return mwi @ state.datum.to_world(p[0], p[1])
+
+        if cont is not None:
+            old_segments = manager.load_committed_segments(cont)
+            if old_segments:
+                removed, blocked, missing = self._remove_committed_edges(
+                    bm, old_segments)
+                if removed:
+                    self.report({'INFO'},
+                                f"已替换上一轮提交的 {removed} 条轮廓边")
+                if blocked:
+                    self.report({'WARNING'},
+                                f"{blocked} 条旧轮廓边已被建模引用"
+                                "（存在关联面），保留未删；如需清理"
+                                "请手动处理")
+                if missing:
+                    self.report({'WARNING'},
+                                f"{missing} 条旧轮廓边未能定位"
+                                "（可能已被手动编辑），保留未删")
+
+        # 3. 提交当前几何：line 直接两点；circle/arc 离散为折线段
+        #    （与 GPU 预览同密度），端点经 round6 缓存共享顶点
+        #    （相邻实体端点自动焊接）；同步收集本次提交快照
         vert_cache = {}
 
         def get_vert(p):
             key = (round(p[0], 6), round(p[1], 6))
             v = vert_cache.get(key)
             if v is None:
-                v = bm.verts.new(mwi @ state.datum.to_world(p[0], p[1]))
+                v = bm.verts.new(to_local(p))
                 vert_cache[key] = v
             return v
 
-        for p1, p2 in state.sketch.line_segments():
-            try:
-                bm.edges.new((get_vert(p1), get_vert(p2)))
-            except ValueError:
-                pass  # 重合边，跳过
+        new_segments = []
+        for e in entities:
+            for a, b in cmt.entity_segments(e):
+                try:
+                    bm.edges.new((get_vert(a), get_vert(b)))
+                except ValueError:
+                    pass  # 重合边，跳过
+                new_segments.append(
+                    [list(to_local(a)), list(to_local(b))])
 
         bm.verts.ensure_lookup_table()
         bmesh.update_edit_mesh(obj.data)
+
+        if cont is not None:
+            manager.save_committed_segments(cont, new_segments)
 
         try:
             bpy.ops.ed.undo_push()
         except Exception:
             pass
         return len(state.points_2d)
+
+    def _remove_committed_edges(self, bm, old_segments):
+        """按上一轮提交快照（宿主局部坐标段）删除 mesh 中的旧轮廓边。
+
+        边两端点 round6 匹配即视为本插件提交物；被 face 引用（用户
+        已基于提交物建模）或坐标已被手动编辑（匹配不到）的边保留
+        并计数——绝不触碰非本草图提交物的几何。删边后清理被删边
+        留下的孤立顶点（不再被任何边/面引用时）。
+        返回 (removed, blocked, missing)。
+        """
+        def vkey(co):
+            return (round(co[0], 6), round(co[1], 6), round(co[2], 6))
+
+        edge_map = {}
+        for e in bm.edges:
+            k = cmt.seg_key(e.verts[0].co, e.verts[1].co)
+            edge_map.setdefault(k, e)
+
+        touched = set()
+        to_remove = []
+        removed = blocked = missing = 0
+        for seg in old_segments:
+            try:
+                k = cmt.seg_key(seg[0], seg[1])
+            except (TypeError, IndexError):
+                missing += 1
+                continue
+            edge = edge_map.pop(k, None)
+            if edge is None:
+                missing += 1
+                continue
+            if edge.link_faces:
+                blocked += 1
+                continue
+            to_remove.append(edge)
+            touched.update(cmt.seg_key(seg[0], seg[1]))
+            removed += 1
+        for e in to_remove:
+            bm.edges.remove(e)
+        for v in list(bm.verts):
+            if v.link_edges or v.link_faces or vkey(v.co) not in touched:
+                continue
+            bm.verts.remove(v)
+        return removed, blocked, missing
 
     def _cleanup(self, context):
         state.active = False

@@ -35,5 +35,4 @@ def test_apply_roundtrip_and_field_preservation():
 
 def test_unknown_entity_type_raises():
     with pytest.raises(UnknownEntityTypeError):
-        ParamLayout([{"id": 1, "type": "circle", "center": [0, 0],
-                      "radius": 1.0}])
+        ParamLayout([{"id": 1, "type": "spline"}])

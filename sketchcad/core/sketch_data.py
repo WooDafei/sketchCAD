@@ -11,11 +11,20 @@ Phase 2 起数据模型承载 constraints 数组（§4 约束系统）。schema 
   折线连接惯例默认 [1, 0]（前段终点接后段起点）；
 - distance 携带 "value"（目标长度），残差采用 dx²+dy²-value² 光滑形式；
 - 实体与约束共用同一 id 空间（_next_id 取两者最大值 +1）。
+
+Phase 3 起顶层新增可选 "visible" 字段（管理器隐藏/显示，缺省 True
+兼容既有数据）；约束级联提供按端点（coincident@endpoint）与按类型
+（如 trim/extend 后移除失效的 distance）的删除入口。
+
+Phase 3 圆弧实体（§4 混合草图）：circle 存 center/radius（3 参数），
+arc 存 center/radius/a1/a2（5 参数），弧从 a1 逆时针扫到 a2（方向
+约定见 core/geom.py）；新约束 radius / concentric / tangent。
 """
 
 import json
 
 from .datum import Datum
+from .geom import arc_point
 
 SCHEMA_VERSION = 1
 PROP_KEY = "SketchCAD_Data"
@@ -28,6 +37,7 @@ class SketchData:
             "object": None, "face_snapshot": None}
         self.entities = []
         self.constraints = []
+        self.visible = True
 
     # ---- 实体操作 ----
 
@@ -45,6 +55,27 @@ class SketchData:
             "p2": [p2[0], p2[1]],
             "construction": bool(construction),
         })
+
+    def add_circle(self, center, radius, construction=False):
+        self.entities.append({
+            "id": self._next_id(),
+            "type": "circle",
+            "center": [center[0], center[1]],
+            "radius": float(radius),
+            "construction": bool(construction),
+        })
+
+    def add_arc(self, center, radius, a1, a2, construction=False):
+        self.entities.append({
+            "id": self._next_id(),
+            "type": "arc",
+            "center": [center[0], center[1]],
+            "radius": float(radius),
+            "a1": float(a1),
+            "a2": float(a2),
+            "construction": bool(construction),
+        })
+
 
     # ---- 约束操作 ----
 
@@ -102,12 +133,49 @@ class SketchData:
                 return True
         return False
 
-    def remove_constraints_for_entity(self, eid):
-        """删除所有 target 引用 eid 的约束，返回删除数量。"""
+    def remove_constraints_for_entity(self, eid, ctype=None):
+        """删除所有 target 引用 eid 的约束，返回删除数量。
+
+        ctype 指定时仅删除该类型（如 trim/extend 后仅移除失效的
+        distance，保留 horizontal/vertical 等方向语义约束）。
+        """
         before = len(self.constraints)
+
+        def hit(c):
+            if eid not in (c.get("targets") or []):
+                return False
+            return ctype is None or c.get("type") == ctype
+
         self.constraints = [
-            c for c in self.constraints
-            if eid not in (c.get("targets") or [])
+            c for c in self.constraints if not hit(c)
+        ]
+        return before - len(self.constraints)
+
+    def remove_constraints_for_endpoint(self, eid, pos):
+        """删除 coincident 约束中引用 eid 实体 endpoint pos 的约束。
+
+        endpoints 与 targets 一一对应；trim/extend 改变某端位置后，
+        固接在原位置会与用户意图冲突，由编辑工具级联清理。固接类 =
+        coincident 与 point_on_line（线上点），endpoints 缺省时按各自
+        惯例默认值判定（coincident=[1,0]，point_on_line=[0,None]）。
+        """
+        before = len(self.constraints)
+
+        def hit(c):
+            ctype = c.get("type")
+            if (ctype not in ("coincident", "point_on_line")
+                    or eid not in (c.get("targets") or [])):
+                return False
+            ep = c.get("endpoints")
+            if ep is None:
+                ep = (1, 0) if ctype == "coincident" else (0, None)
+            for i, t in enumerate(c.get("targets") or []):
+                if t == eid and i < len(ep) and ep[i] == pos:
+                    return True
+            return False
+
+        self.constraints = [
+            c for c in self.constraints if not hit(c)
         ]
         return before - len(self.constraints)
 
@@ -158,6 +226,7 @@ class SketchData:
                 "x_axis": list(d.x_axis),
             },
             "host": self.host,
+            "visible": self.visible,
             "entities": self.entities,
             "constraints": self.constraints,
         }
@@ -174,10 +243,17 @@ class SketchData:
         s = cls(datum, host=data.get("host"))
         s.entities = list(data.get("entities") or [])
         s.constraints = list(data.get("constraints") or [])
+        s.visible = bool(data.get("visible", True))
         return s
 
     def to_json(self):
         return json.dumps(self.to_dict())
+
+
+def arc_endpoints(e):
+    """arc 实体的两端点坐标 (pos0, pos1)（center/r/a1/a2 现算）。"""
+    c, r = e["center"], e["radius"]
+    return arc_point(c, r, e["a1"]), arc_point(c, r, e["a2"])
 
 
 def load_from_object(obj):
