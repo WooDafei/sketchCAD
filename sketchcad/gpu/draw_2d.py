@@ -21,6 +21,7 @@ from gpu_extras.batch import batch_for_shader
 from ..core import geom
 from ..core.state import state
 from ..solver.dof import STATUS_FULL, STATUS_OVER
+from ..snapping import aid_points as aid_pts
 from ..snapping import snap
 
 _MODE_HINT = {
@@ -33,14 +34,20 @@ _MODE_HINT = {
 }
 
 _TOOL_HINT = {
-    "trim": ("TRIM: click the part of a segment to REMOVE "
-             "(cut at nearest intersection, keep the other side; "
-             "lines only)"),
-    "extend": ("EXTEND: 1st click pick segment | move to preview | "
+    "trim": ("TRIM: click the part of a line/arc to REMOVE "
+             "(cut at nearest inner intersection, keep the other "
+             "side; circles excluded)"),
+    "extend": ("EXTEND: 1st click pick line/arc | move to preview | "
                "2nd click confirms end point | ESC cancels pick"),
     "offset": ("OFFSET: 1st click pick line (closed profile/chain) / "
                "circle / arc | move to preview, or type distance + "
                "Enter | 2nd click confirms | ESC cancels pick"),
+    "mirror": ("MIRROR: click entities (click again to deselect) | "
+               "Enter to lock | click a LINE as mirror axis | "
+               "Enter generates | ESC steps back"),
+    "pattern": ("PATTERN: click entities | Enter | click a line "
+                "(linear) or circle/arc (circular) | move/type step + "
+                "Enter | type count + Enter | ESC steps back"),
 }
 
 _DRAW_TOOL_HINT = {
@@ -58,6 +65,8 @@ _COLOR_SNAP_ENDPOINT = (1.0, 0.45, 0.1, 1.0)
 _COLOR_SNAP_MIDPOINT = (1.0, 0.3, 0.85, 1.0)
 _COLOR_SNAP_CENTER = (0.3, 1.0, 0.5, 1.0)
 _COLOR_SNAP_ON_LINE = (0.2, 1.0, 1.0, 1.0)
+_COLOR_SNAP_AID = (0.7, 0.4, 1.0, 1.0)
+_COLOR_AID = (0.55, 0.55, 0.62, 0.65)
 _COLOR_CENTER_MARK = (0.75, 0.75, 0.75, 0.85)
 _COLOR_SELECTED = (1.0, 0.5, 0.1, 1.0)
 
@@ -77,6 +86,37 @@ def _draw_line_strip(shader, d, coords, color, width=2.5):
     shader.uniform_float("color", color)
     batch.draw(shader)
     gpu.state.line_width_set(2.5)
+
+
+def _entity_by_id(entities, eid):
+    for e in entities:
+        if e.get("id") == eid:
+            return e
+    return None
+
+
+def _draw_entity_preview(shader, d, e, color, width=None):
+    """预览实体绘制（mirror/pattern 生成结果：line/circle/arc）。"""
+    t = e.get("type")
+    if t == "line":
+        if width is not None:
+            gpu.state.line_width_set(width)
+        batch = batch_for_shader(shader, 'LINES', {"pos": [
+            d.to_world(e["p1"][0], e["p1"][1]),
+            d.to_world(e["p2"][0], e["p2"][1])]})
+        shader.bind()
+        shader.uniform_float("color", color)
+        batch.draw(shader)
+        if width is not None:
+            gpu.state.line_width_set(2.5)
+    elif t == "circle":
+        _draw_line_strip(shader, d, _strip_coords(
+            d, e["center"], e["radius"], 0.0, geom.TWO_PI), color,
+            width=width or 2.5)
+    elif t == "arc":
+        _draw_line_strip(shader, d, _strip_coords(
+            d, e["center"], e["radius"], e["a1"], e["a2"]), color,
+            width=width or 2.5)
 
 
 def _draw_hud_text():
@@ -225,6 +265,17 @@ def draw_sketch():
         batch.draw(shader)
         gpu.state.point_size_set(8.0)
 
+    # 2.55 宿主顶点投影辅助点（§5 3D 投影：暗灰小点，描图对齐参照，
+    # 捕捉候选 AID_POINT 优先级低于草图自身特征）
+    if state.aid_points:
+        pts = [d.to_world(u, v) for u, v in state.aid_points]
+        gpu.state.point_size_set(4.0)
+        batch = batch_for_shader(shader, 'POINTS', {"pos": pts})
+        shader.bind()
+        shader.uniform_float("color", _COLOR_AID)
+        batch.draw(shader)
+        gpu.state.point_size_set(8.0)
+
     # 2.5 选中实体高亮（select 模式，加粗橙色）
     if state.selected_entity is not None:
         for e in state.sketch.entities:
@@ -307,15 +358,21 @@ def draw_sketch():
                 shader.uniform_float("color", _COLOR_RUBBER)
                 batch.draw(shader)
 
-    # 3.5 延伸预览（extend 第二段：被选端 -> 鼠标在延长线上的投影点）
+    # 3.5 延伸预览（extend 第二段：line 弦线 / arc 圆周延长段）
     if state.extend_preview is not None:
-        _pos, from_pt, to_pt = state.extend_preview
-        batch = batch_for_shader(shader, 'LINES', {"pos": [
-            d.to_world(from_pt[0], from_pt[1]),
-            d.to_world(to_pt[0], to_pt[1])]})
-        shader.bind()
-        shader.uniform_float("color", _COLOR_RUBBER)
-        batch.draw(shader)
+        pv = state.extend_preview
+        if pv["kind"] == "arc":
+            lo, hi = pv["strip"]
+            _draw_line_strip(shader, d, _strip_coords(
+                d, pv["center"], pv["radius"], lo, hi), _COLOR_RUBBER)
+        else:
+            from_pt, to_pt = pv["from_pt"], pv["to_pt"]
+            batch = batch_for_shader(shader, 'LINES', {"pos": [
+                d.to_world(from_pt[0], from_pt[1]),
+                d.to_world(to_pt[0], to_pt[1])]})
+            shader.bind()
+            shader.uniform_float("color", _COLOR_RUBBER)
+            batch.draw(shader)
 
     # 3.6 偏移预览（offset 第二段：黄色预览几何，侧向/距离由鼠标驱动）
     if state.offset_preview is not None:
@@ -338,6 +395,62 @@ def draw_sketch():
             _draw_line_strip(shader, d, _strip_coords(
                 d, pv["center"], pv["radius"], pv["a1"], pv["a2"]),
                 _COLOR_RUBBER)
+
+    # 3.7 Mirror：选集高亮 + 镜像轴橙色加粗 + 镜像预览（黄色）
+    if state.tool == 'mirror':
+        for eid in state.mirror_pending:
+            e = _entity_by_id(state.sketch.entities, eid)
+            if e is not None:
+                _draw_entity_preview(shader, d, e, _COLOR_SELECTED,
+                                     width=4.5)
+        if state.mirror_axis is not None:
+            ax = _entity_by_id(state.sketch.entities, state.mirror_axis)
+            if ax is not None and ax.get("type") == "line":
+                gpu.state.line_width_set(4.5)
+                batch = batch_for_shader(shader, 'LINES', {"pos": [
+                    d.to_world(ax["p1"][0], ax["p1"][1]),
+                    d.to_world(ax["p2"][0], ax["p2"][1])]})
+                shader.bind()
+                shader.uniform_float("color", _COLOR_SELECTED)
+                batch.draw(shader)
+                gpu.state.line_width_set(2.5)
+        if state.mirror_preview:
+            for e in state.mirror_preview:
+                _draw_entity_preview(shader, d, e, _COLOR_RUBBER)
+
+    # 3.8 Pattern：选集高亮 + 参照高亮（线加粗 / 中心橙点）+
+    # 阵列预览（黄色，step=单副本 / count=全量）
+    if state.tool == 'pattern':
+        for eid in state.pattern_pending:
+            e = _entity_by_id(state.sketch.entities, eid)
+            if e is not None:
+                _draw_entity_preview(shader, d, e, _COLOR_SELECTED,
+                                     width=4.5)
+        if state.pattern_axis is not None:
+            ax = _entity_by_id(state.sketch.entities, state.pattern_axis)
+            if ax is not None:
+                t = ax.get("type")
+                if t == "line":
+                    gpu.state.line_width_set(4.5)
+                    batch = batch_for_shader(shader, 'LINES', {"pos": [
+                        d.to_world(ax["p1"][0], ax["p1"][1]),
+                        d.to_world(ax["p2"][0], ax["p2"][1])]})
+                    shader.bind()
+                    shader.uniform_float("color", _COLOR_SELECTED)
+                    batch.draw(shader)
+                    gpu.state.line_width_set(2.5)
+                elif t in ("circle", "arc"):
+                    gpu.state.point_size_set(10.0)
+                    batch = batch_for_shader(shader, 'POINTS', {
+                        "pos": [d.to_world(ax["center"][0],
+                                           ax["center"][1])]})
+                    shader.bind()
+                    shader.uniform_float("color", _COLOR_SELECTED)
+                    batch.draw(shader)
+                    gpu.state.point_size_set(8.0)
+        if state.pattern_preview:
+            for e in state.pattern_preview:
+                _draw_entity_preview(shader, d, e, _COLOR_RUBBER)
 
     # 4. 确认点（黄白，画线笔划）
     if state.points_2d:
@@ -395,6 +508,15 @@ def draw_sketch():
                 x + half * math.cos(i / 16.0 * 2.0 * math.pi),
                 y + half * math.sin(i / 16.0 * 2.0 * math.pi))
                 for i in range(17)]
+        elif kind == aid_pts.SNAP_AID_POINT:
+            # 菱形（宿主顶点投影辅助点标记惯例）
+            dia = [(x, y + half), (x + half, y),
+                   (x, y - half), (x - half, y)]
+            mark_lines = []
+            for i in range(4):
+                a, b = dia[i], dia[(i + 1) % 4]
+                mark_lines += [d.to_world(a[0], a[1]),
+                               d.to_world(b[0], b[1])]
         else:  # SNAP_ON_LINE：叉号（CAD 线上点/交点标记惯例）
             mark_lines = [
                 d.to_world(x - half, y - half),
@@ -405,6 +527,7 @@ def draw_sketch():
         color = (_COLOR_SNAP_ENDPOINT if kind == snap.SNAP_ENDPOINT
                  else _COLOR_SNAP_MIDPOINT if kind == snap.SNAP_MIDPOINT
                  else _COLOR_SNAP_CENTER if kind == snap.SNAP_CENTER
+                 else _COLOR_SNAP_AID if kind == aid_pts.SNAP_AID_POINT
                  else _COLOR_SNAP_ON_LINE)
         shader.bind()
         shader.uniform_float("color", color)

@@ -278,6 +278,12 @@ class SKETCHCAD_PT_main(bpy.types.Panel):
                 label += " · unlinked"
             row = box.row(align=True)
             row.label(text=label, icon='EMPTY_DATA')
+            if not is_session:
+                # 独立打开入口（§2 遗留收尾）：断开关联的草图也按
+                # 存储的 datum 坐标系直接进入（不依赖宿主面）
+                op = row.operator("sketch.face_driven_sketch", text="",
+                                  icon='PLAY')
+                op.container_name = obj.name
             op = row.operator("sketchcad.toggle_sketch_visible", text="",
                               icon='HIDE_ON' if data.visible else 'HIDE_OFF',
                               depress=not data.visible)

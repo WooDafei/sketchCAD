@@ -66,12 +66,14 @@ from ..core.state import CONSTRAINT_VISIBLE, CONSTRAINT_WHEEL_STEP, state
 from ..drawing import auto_constraints as ac
 from ..drawing import picking
 from ..editing import commit as cmt
+from ..editing import mirror_pattern as mp
 from ..editing import offset as off
 from ..editing import trim_extend as te
 from ..editing.loops import detect_closed_loops
 from ..gpu.draw_2d import draw_sketch
 from ..solver import apply as solver_apply
 from ..solver import dof as solver_dof
+from ..snapping import aid_points as ap
 from ..snapping import snap
 
 _NAV_EVENTS = {'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'MIDDLEMOUSE'}
@@ -81,8 +83,9 @@ _DIGIT_KEYS = {str(i) for i in range(10)}
 _NUMPAD_DIGIT = {f"NUMPAD_{i}": str(i) for i in range(10)}
 _PERIOD_KEYS = ('PERIOD', 'NUMPAD_PERIOD')
 
-# select 模式编辑工具快捷键（T 修剪 / E 延伸 / O 偏移）
-_TOOL_KEYS = {'T': 'trim', 'E': 'extend', 'O': 'offset'}
+# select 模式编辑工具快捷键（T 修剪 / E 延伸 / O 偏移 / M 镜像 / P 阵列）
+_TOOL_KEYS = {'T': 'trim', 'E': 'extend', 'O': 'offset',
+              'M': 'mirror', 'P': 'pattern'}
 
 # draw 模式子工具快捷键（L 直线 / C 圆 / A 三点弧）
 _DRAW_TOOL_KEYS = {'L': 'line', 'C': 'circle', 'A': 'arc'}
@@ -102,13 +105,19 @@ _UNDO_LIMIT = 100
 
 
 class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
-    """基于选中面进入 SketchCAD 草图模式"""
+    """基于选中面进入 SketchCAD 草图模式（container_name 指定时为独立打开入口）"""
     bl_idname = "sketch.face_driven_sketch"
     bl_label = "Start Face Sketch"
+
+    # 独立打开入口（N-Panel"打开"按钮）：按容器名进入会话，不依赖
+    # 宿主面（断开关联的草图以存储的 datum 坐标系直接对齐）
+    container_name: bpy.props.StringProperty(default="")
 
     # ---- 进入 ----
 
     def invoke(self, context, event):
+        if self.container_name:
+            return self._invoke_open(context, event)
         if context.mode != 'EDIT_MESH':
             self.report({'WARNING'}, "请进入编辑模式并选中一个面")
             return {'CANCELLED'}
@@ -129,6 +138,8 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         mw = obj.matrix_world
         normal_w = (mw.inverted().transposed().to_3x3() @ face.normal).normalized()
         center_w = mw @ face.calc_center_median()
+        # 宿主顶点世界坐标采集（§5 辅助点投影源数据，即取即用不持有）
+        host_verts = [tuple(mw @ v.co) for v in bm.verts]
 
         # Phase 0 重进对齐：按宿主对象名 + 面快照匹配已有草图
         matched_obj, matched_data = manager.find_matching_sketch(
@@ -162,6 +173,48 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             else:
                 self.report({'INFO'}, "新建草图")
 
+        return self._start_session(context, sketch, container_name,
+                                   host_verts=host_verts)
+
+    def _invoke_open(self, context, event):
+        """独立打开入口（§2 遗留收尾）：按容器名进入会话。
+
+        断开关联的草图无宿主面可匹配，以存储的 datum 坐标系直接
+        对齐进入；退出时仅保存容器 JSON、不提交 mesh（§9 所有权
+        边界——无宿主即无提交目标）。N-Panel 按钮触发时 context
+        位于 UI region，定位 3D 视口后以 override 执行启动。
+        """
+        if state.active:
+            self.report({'WARNING'}, "草图会话进行中，请先 ESC 退出")
+            return {'CANCELLED'}
+        obj, sketch = manager.load_sketch(self.container_name)
+        if sketch is None:
+            self.report({'WARNING'},
+                        f"草图 {self.container_name} 不存在或数据缺失")
+            return {'CANCELLED'}
+        area = next((a for a in context.window.screen.areas
+                     if a.type == 'VIEW_3D'), None)
+        if area is None:
+            self.report({'WARNING'}, "未找到 3D 视口区域")
+            return {'CANCELLED'}
+        region = next(r for r in area.regions if r.type == 'WINDOW')
+        rv3d = area.spaces.active.region_data
+        self.report({'INFO'},
+                    f"独立打开草图 {self.container_name}"
+                    f"（{len(sketch.entities)} 个实体，无宿主不提交 mesh）")
+        with context.temp_override(area=area, region=region,
+                                   region_data=rv3d):
+            return self._start_session(context, sketch,
+                                       self.container_name)
+
+    def _start_session(self, context, sketch, container_name,
+                       host_verts=None):
+        """会话启动公共入口（选面进入 / 独立打开共用）。
+
+        host_verts：宿主顶点世界坐标序列（选面进入时采集）；独立
+        打开无宿主传 None，辅助点为空。宿主 ghost：display_type
+        临时置线框（退出恢复），突出草图平面。
+        """
         state.reset()
         state.active = True
         state.datum = sketch.datum
@@ -171,6 +224,26 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         self._refresh_dof()
 
         self._align_view(context, sketch.datum)
+
+        # §5 辅助点：宿主顶点投影基准面（进入时固化——会话内宿主
+        # 几何不变）；深度阈值取对齐后视图半径（平面外过远的顶点
+        # 投影会产生干扰描图的幻影点）
+        state.aid_points = []
+        if host_verts:
+            rv3d = context.region_data
+            depth_tol = rv3d.view_distance if rv3d is not None else None
+            state.aid_points = ap.collect_aid_points(
+                host_verts, sketch.datum, depth_tol)
+
+        state.host_obj_name = None
+        state.host_display_type = None
+        host_name = (sketch.host or {}).get("object")
+        if host_name:
+            host_obj = bpy.data.objects.get(host_name)
+            if host_obj is not None:
+                state.host_obj_name = host_name
+                state.host_display_type = host_obj.display_type
+                host_obj.display_type = 'WIRE'
 
         state.draw_handler = bpy.types.SpaceView3D.draw_handler_add(
             draw_sketch, (), 'WINDOW', 'POST_VIEW')
@@ -184,8 +257,8 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         self.report({'INFO'},
                     "SketchCAD 草图模式 | 画线: 左键加点, 双击/Enter 结束"
                     " | L/C/A 切直线/圆/弧 | Tab 选择模式(输数值+回车"
-                    "定尺寸, T 修剪, E 延伸) | 右键/Ctrl+Z 撤销, "
-                    "Ctrl+Shift+Z 重做 | ESC 提交退出")
+                    "定尺寸, T 修剪, E 延伸, O 偏移, M 镜像, P 阵列) | "
+                    "右键/Ctrl+Z 撤销, Ctrl+Shift+Z 重做 | ESC 提交退出")
         return {'RUNNING_MODAL'}
 
     def _align_view(self, context, datum):
@@ -236,6 +309,9 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                 self._update_extend_preview()
             if state.offset_pending is not None:
                 self._update_offset_preview()
+            if (state.tool == 'pattern'
+                    and state.pattern_stage in ('step', 'count')):
+                self._update_pattern_preview()
             return {'RUNNING_MODAL'}
 
         if event.type == 'TAB' and event.value == 'PRESS':
@@ -256,9 +332,11 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
 
         if (event.value == 'PRESS' and state.mode == "select"
                 and (state.offset_pending is not None
+                     or (state.tool == 'pattern'
+                         and state.pattern_stage in ('step', 'count'))
                      or (state.tool is None
                          and state.selected_entity is not None))):
-            # 数值输入：选中实体定尺寸，或偏移预览中输入偏移距离
+            # 数值输入：选中实体定尺寸、偏移距离或阵列步距/份数
             if self._on_input_key(event.type):
                 return {'RUNNING_MODAL'}
 
@@ -276,6 +354,10 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                         self._apply_extend(context)
                     elif state.tool == 'offset':
                         self._apply_offset(context)
+                    elif state.tool == 'mirror':
+                        self._apply_mirror(context)
+                    elif state.tool == 'pattern':
+                        self._apply_pattern(context)
                     else:
                         self._press_select(context, state.mouse_2d)
                 else:
@@ -304,7 +386,26 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
 
         if event.type == 'RET' and event.value == 'PRESS':
             if state.mode == "select":
-                if (state.tool == 'offset'
+                if state.tool == 'mirror':
+                    if state.mirror_stage == 'pick':
+                        if state.mirror_pending:
+                            state.mirror_stage = 'axis'
+                            self.report({'INFO'},
+                                        "镜像：点击一条线作为镜像轴")
+                    elif state.mirror_stage == 'confirm':
+                        self._confirm_mirror()
+                elif state.tool == 'pattern':
+                    if state.pattern_stage == 'pick':
+                        if state.pattern_pending:
+                            state.pattern_stage = 'axis'
+                            self.report({'INFO'},
+                                        "阵列：点击线 = 线性阵列方向；"
+                                        "点击圆/弧 = 圆形阵列中心")
+                    elif state.pattern_stage == 'step':
+                        self._confirm_pattern_step()
+                    elif state.pattern_stage == 'count':
+                        self._confirm_pattern()
+                elif (state.tool == 'offset'
                         and state.offset_pending is not None):
                     # 数值确认：按输入距离偏移（侧向用当前鼠标位置）
                     self._confirm_offset()
@@ -327,8 +428,13 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
 
         if event.type == 'ESC' and event.value == 'PRESS':
             if state.tool is not None:
-                # 延伸/偏移未确认时先取消选择，再按才退出工具
-                if state.extend_pending is not None:
+                # 阶段化回退：mirror/pattern 逐阶段退，未确认时先取消
+                # 选择，再按才退出工具
+                if state.tool == 'mirror':
+                    self._esc_mirror()
+                elif state.tool == 'pattern':
+                    self._esc_pattern()
+                elif state.extend_pending is not None:
                     state.extend_pending = None
                     state.extend_preview = None
                 elif state.offset_pending is not None:
@@ -379,10 +485,11 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             state.mouse_2d = raw_2d
 
     def _find_snap(self, context, event, raw_2d):
-        """像素级最近捕捉特征；端点 > 中点/线上点。返回 (kind, (u, v)) 或 None。
+        """像素级最近捕捉特征；端点 > 中点/线上点 > 辅助点。返回 (kind, (u, v)) 或 None。
 
         线上点候选（鼠标在既有线上的垂足）依赖鼠标位置，由 raw_2d
-        （未吸附的基准面投影点）驱动生成。
+        （未吸附的基准面投影点）驱动生成；辅助点（宿主顶点投影）
+        优先级最低，避免干扰草图自身特征捕捉。
         """
         region = context.region
         rv3d = context.region_data
@@ -403,6 +510,17 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                 continue
             priority = 0 if kind == snap.SNAP_ENDPOINT else 1
             cand = (priority, dist, kind, (u, v))
+            if best is None or (cand[0], cand[1]) < (best[0], best[1]):
+                best = cand
+        for u, v, kind in ap.collect_aid_candidates(
+                state.aid_points, raw_2d, tol_world):
+            px = location_3d_to_region_2d(region, rv3d, d.to_world(u, v))
+            if px is None:
+                continue
+            dist = ((px[0] - mx) ** 2 + (px[1] - my) ** 2) ** 0.5
+            if dist > snap.SNAP_PIXEL_TOLERANCE:
+                continue
+            cand = (2, dist, kind, (u, v))
             if best is None or (cand[0], cand[1]) < (best[0], best[1]):
                 best = cand
         if best is None:
@@ -459,26 +577,54 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         state.extend_preview = None
         state.offset_pending = None
         state.offset_preview = None
+        state.mirror_pending = []
+        state.mirror_stage = None
+        state.mirror_axis = None
+        state.mirror_preview = None
+        state.pattern_pending = []
+        state.pattern_stage = None
+        state.pattern_axis = None
+        state.pattern_kind = None
+        state.pattern_step = None
+        state.pattern_preview = None
         if state.tool is None:
             self.report({'INFO'}, "SketchCAD：编辑工具已退出")
         elif state.tool == 'trim':
             self.report({'INFO'},
-                        "SketchCAD 修剪：点击线段要移除的部分"
-                        "（裁除点击侧，保留另一侧）")
+                        "SketchCAD 修剪：点击线/弧上要移除的部分"
+                        "（在最近内部交点处剪断，裁除点击侧）")
         elif state.tool == 'extend':
             self.report({'INFO'},
-                        "SketchCAD 延伸：点击选中要延伸的线，移动鼠标"
-                        "预览，再次点击确认终点（ESC 取消）")
-        else:
+                        "SketchCAD 延伸：点击选中要延伸的线/弧，移动"
+                        "鼠标预览，再次点击确认终点（ESC 取消）")
+        elif state.tool == 'offset':
             self.report({'INFO'},
                         "SketchCAD 偏移：点击选中线段（须属闭合轮廓）"
                         "或圆/弧，移动鼠标预览，再次点击确认"
                         "（ESC 取消选择）")
+        elif state.tool == 'mirror':
+            state.mirror_stage = 'pick'
+            self.report({'INFO'},
+                        "SketchCAD 镜像：点击选择实体（可多选，再点"
+                        "取消），Enter 确认后点击一条线作镜像轴，"
+                        "Enter 生成")
+        else:
+            state.pattern_stage = 'pick'
+            self.report({'INFO'},
+                        "SketchCAD 阵列：点击选择实体（可多选），"
+                        "Enter 确认后点击线（线性）或圆/弧（圆形）"
+                        "定参照，按提示定步距与份数")
 
     def _pick_for_tool(self, context):
+        """trim/extend 工具拾取：line/arc 实体（circle 整圆不参与）。"""
         tol = picking.SELECT_PIXEL_TOL * self._world_per_pixel(context)
-        return picking.pick_segment(
-            state.mouse_2d, state.sketch.entities, tol)
+        eid = picking.pick_entity(state.mouse_2d, state.sketch.entities, tol)
+        if eid is None:
+            return None
+        ent = self._entity_by_id(eid)
+        if ent is None or ent.get("type") not in ("line", "arc"):
+            return None
+        return eid
 
     def _entity_by_id(self, eid):
         for e in state.sketch.entities:
@@ -490,7 +636,13 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         eid = self._pick_for_tool(context)
         if eid is None:
             return
-        ok, *rest = te.trim_line(state.sketch.entities, eid, state.mouse_2d)
+        ent = self._entity_by_id(eid)
+        if ent is not None and ent.get("type") == "arc":
+            ok, *rest = te.trim_arc(state.sketch.entities, eid,
+                                    state.mouse_2d)
+        else:
+            ok, *rest = te.trim_line(state.sketch.entities, eid,
+                                     state.mouse_2d)
         if not ok:
             reason = rest[0]
             if reason == "no-intersection":
@@ -501,19 +653,25 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                 self._refresh_dof()
                 self.report({'INFO'}, "修剪：保留侧退化，整段已移除")
             return
-        changed_pos, new_p1, new_p2 = rest
+        changed_pos, new_a, new_b = rest
         self._push_undo()
         ent = self._entity_by_id(eid)
         if ent is not None:
-            ent["p1"], ent["p2"] = new_p1, new_p2
-        # 被改变端的原位置固接失效，级联清理；长度语义约束同步移除
+            if ent.get("type") == "arc":
+                # new_a/new_b 为新扫角 (a1, a2)；半径/圆心不变，
+                # radius 约束继续生效
+                ent["a1"], ent["a2"] = new_a, new_b
+            else:
+                ent["p1"], ent["p2"] = new_a, new_b
+                # 被改变端的原位置固接失效，级联清理；长度语义约束同步移除
+                state.sketch.remove_constraints_for_entity(eid, "distance")
+        # 被改变端的原位置固接失效，级联清理（line/arc 同语义）
         state.sketch.remove_constraints_for_endpoint(eid, changed_pos)
-        state.sketch.remove_constraints_for_entity(eid, "distance")
         self._refresh_dof()
         self.report({'INFO'}, "修剪完成（点击侧已裁除）")
 
     def _apply_extend(self, context):
-        """两段式延伸：第一击选中线段，移动鼠标预览，第二击确认终点。"""
+        """两段式延伸：第一击选中线/弧，移动鼠标预览，第二击确认终点。"""
         if state.extend_pending is None:
             eid = self._pick_for_tool(context)
             if eid is None:
@@ -521,29 +679,41 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             state.extend_pending = eid
             self._update_extend_preview()
             self.report({'INFO'},
-                        f"延伸：已选中线段 #{eid}，移动鼠标预览，"
+                        f"延伸：已选中实体 #{eid}，移动鼠标预览，"
                         "再次点击确认终点（ESC 取消选择）")
             return
         eid = state.extend_pending
         ent = self._entity_by_id(eid)
-        if ent is None or ent.get("type") != "line":
+        if ent is None or ent.get("type") not in ("line", "arc"):
             state.extend_pending = None
             state.extend_preview = None
             return
         preview = state.extend_preview
         if preview is None:
             self.report({'WARNING'},
-                        "延伸：请在线段延长线一侧点击确认终点")
+                        "延伸：请在延长方向一侧点击确认终点"
+                        "（弧：扫角外一侧）")
             return
-        pos, _from_pt, to_pt = preview
         self._push_undo()
-        if pos == 0:
-            ent["p1"] = [to_pt[0], to_pt[1]]
+        pos = preview["pos"]
+        if preview["kind"] == "arc":
+            # 弧沿圆周延长：a1 端顺时针扩展 / a2 端逆时针扩展
+            if pos == 0:
+                ent["a1"] = ent["a1"] - preview["delta"]
+            else:
+                ent["a2"] = ent["a2"] + preview["delta"]
+            to_pt = geom.arc_point(ent["center"], ent["radius"],
+                                   ent["a1"] if pos == 0 else ent["a2"])
         else:
-            ent["p2"] = [to_pt[0], to_pt[1]]
-        # 被改变端的原位置固接失效，级联清理；长度语义约束同步移除
+            to_pt = preview["to_pt"]
+            if pos == 0:
+                ent["p1"] = [to_pt[0], to_pt[1]]
+            else:
+                ent["p2"] = [to_pt[0], to_pt[1]]
+            # 长度语义约束同步移除（弧的 radius 约束随半径不变保留）
+            state.sketch.remove_constraints_for_entity(eid, "distance")
+        # 被改变端的原位置固接失效，级联清理
         state.sketch.remove_constraints_for_endpoint(eid, pos)
-        state.sketch.remove_constraints_for_entity(eid, "distance")
         # 终点命中其他实体端点时自动固接（与绘制 coincident 语义一致）
         hit = ac.find_endpoint_hit(to_pt, state.sketch.entities,
                                    exclude_id=eid)
@@ -556,14 +726,31 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         self.report({'INFO'}, "延伸完成")
 
     def _extend_preview_result(self, ent):
-        """延伸预览计算：返回 (pos, from_pt, to_pt) 或 None。
+        """延伸预览计算：返回预览 dict 或 None。
 
-        延伸端取距鼠标较近的端点；终点 = 鼠标在该端延长方向上的
-        投影（投影落在线段内部时延伸无意义，返回 None）。
+        line：延伸端取距鼠标较近的端点，终点 = 鼠标在该端延长线上
+        的投影（投影落在线段内部时延伸无意义）；
+        arc：延伸端取距鼠标方位角较近的端（a1 端顺时针扩展 /
+        a2 端逆时针扩展），鼠标方位角落在扫角内时延伸无意义。
         """
         m = state.mouse_2d
         if m is None:
             return None
+        if ent.get("type") == "arc":
+            res = te.extend_arc_result(ent, m)
+            if res is None:
+                return None
+            pos, delta = res
+            c, r = ent["center"], ent["radius"]
+            from_ang = ent["a1"] if pos == 0 else ent["a2"]
+            to_ang = (ent["a1"] - delta) if pos == 0 \
+                else (ent["a2"] + delta)
+            lo, hi = (to_ang, from_ang) if pos == 0 else (from_ang, to_ang)
+            return {"kind": "arc", "pos": pos, "delta": delta,
+                    "center": [c[0], c[1]], "radius": r,
+                    "from_pt": list(geom.arc_point(c, r, from_ang)),
+                    "to_pt": list(geom.arc_point(c, r, to_ang)),
+                    "strip": (lo, hi)}
         p1, p2 = ent["p1"], ent["p2"]
         t_m = te.project_param(p1, p2, m)
         if t_m > 1.0 + te.PARAM_EPS:
@@ -574,11 +761,12 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             return None
         pt = te.point_at(p1, p2, t_m)
         from_pt = (p1[0], p1[1]) if pos == 0 else (p2[0], p2[1])
-        return pos, from_pt, (pt[0], pt[1])
+        return {"kind": "line", "pos": pos, "to_pt": (pt[0], pt[1]),
+                "from_pt": [from_pt[0], from_pt[1]]}
 
     def _update_extend_preview(self):
         ent = self._entity_by_id(state.extend_pending)
-        if ent is None or ent.get("type") != "line":
+        if ent is None or ent.get("type") not in ("line", "arc"):
             state.extend_pending = None
             state.extend_preview = None
             return
@@ -718,6 +906,294 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         self._refresh_dof()
         self.report({'INFO'}, "偏移完成（独立实体，未加偏移约束）")
 
+    # ---- Mirror 镜像（SketchCAD.md §6，editing/mirror_pattern.py）----
+
+    def _pick_multi(self, context, pending):
+        """点击累加/移出多选实体（mirror/pattern 选集共用）。"""
+        eid = picking.pick_entity(
+            state.mouse_2d, state.sketch.entities,
+            picking.SELECT_PIXEL_TOL * self._world_per_pixel(context))
+        if eid is None:
+            return
+        if eid in pending:
+            pending.remove(eid)
+        else:
+            pending.append(eid)
+
+    def _apply_mirror(self, context):
+        """镜像三阶段：选实体（累加多选）→ 选轴（线）→ Enter 生成。"""
+        if state.mirror_stage == 'pick':
+            self._pick_multi(context, state.mirror_pending)
+            return
+        # axis / confirm 阶段：点击线设置或更换镜像轴
+        eid = picking.pick_entity(
+            state.mouse_2d, state.sketch.entities,
+            picking.SELECT_PIXEL_TOL * self._world_per_pixel(context))
+        if eid is None:
+            return
+        ent = self._entity_by_id(eid)
+        if ent is None or ent.get("type") != "line":
+            self.report({'WARNING'}, "镜像：轴必须是线段（点击一条线）")
+            return
+        state.mirror_axis = eid
+        self._update_mirror_preview()
+        if state.mirror_preview is None:
+            state.mirror_axis = None
+            self.report({'WARNING'},
+                        "镜像：预览计算失败（选集含已失效实体？）")
+            return
+        state.mirror_stage = 'confirm'
+        self.report({'INFO'},
+                    "镜像：预览已显示，Enter 确认生成（ESC 换轴）")
+
+    def _update_mirror_preview(self):
+        axis = self._entity_by_id(state.mirror_axis)
+        ents = [self._entity_by_id(eid) for eid in state.mirror_pending]
+        if (axis is None or not ents
+                or any(e is None for e in ents)):
+            state.mirror_preview = None
+            return
+        state.mirror_preview = mp.mirror_entities(
+            ents, tuple(axis["p1"]), tuple(axis["p2"]))
+
+    def _confirm_mirror(self):
+        if (state.mirror_stage != 'confirm'
+                or state.mirror_preview is None):
+            self.report({'WARNING'}, "镜像：请先选择实体并点击镜像轴")
+            return
+        self._push_undo()
+        for d in state.mirror_preview:
+            mp.add_entity_copy(state.sketch, d)
+        state.mirror_pending = []
+        state.mirror_axis = None
+        state.mirror_preview = None
+        state.mirror_stage = 'pick'
+        self._refresh_dof()
+        self.report({'INFO'}, "镜像完成（独立实体副本）")
+
+    def _esc_mirror(self):
+        if state.mirror_stage == 'confirm':
+            state.mirror_axis = None
+            state.mirror_preview = None
+            state.mirror_stage = 'axis'
+            self.report({'INFO'}, "镜像：已取消轴，重新点击一条线")
+        elif state.mirror_stage == 'axis':
+            state.mirror_stage = 'pick'
+        else:  # pick：选集非空先清空，空则退出工具
+            if state.mirror_pending:
+                state.mirror_pending = []
+            else:
+                state.tool = None
+                self.report({'INFO'}, "SketchCAD：编辑工具已退出")
+
+    # ---- Pattern 阵列（SketchCAD.md §6，editing/mirror_pattern.py）----
+
+    def _apply_pattern(self, context):
+        """阵列四阶段：选实体 → 选参照 → 定步距 → 定份数。
+
+        参照语义：line = 线性阵列方向（沿线方向平移）；
+        circle/arc = 圆形阵列中心（绕其圆心旋转）。
+        """
+        if state.pattern_stage == 'pick':
+            self._pick_multi(context, state.pattern_pending)
+            return
+        if state.pattern_stage == 'axis':
+            eid = picking.pick_entity(
+                state.mouse_2d, state.sketch.entities,
+                picking.SELECT_PIXEL_TOL * self._world_per_pixel(context))
+            if eid is None:
+                return
+            ent = self._entity_by_id(eid)
+            t = ent.get("type") if ent is not None else None
+            if t == "line":
+                state.pattern_kind = 'linear'
+            elif t in ("circle", "arc"):
+                state.pattern_kind = 'circular'
+            else:
+                self.report({'WARNING'},
+                            "阵列：点击线（线性阵列）或圆/弧"
+                            "（圆形阵列）")
+                return
+            state.pattern_axis = eid
+            state.pattern_stage = 'step'
+            state.input_buffer = ""
+            if state.pattern_kind == 'linear':
+                self.report({'INFO'},
+                            "阵列：移动鼠标预览或输入间距（负值反向），"
+                            "回车确认步距")
+            else:
+                self.report({'INFO'},
+                            "阵列：移动鼠标预览或输入角度（度，负值"
+                            "顺时针），回车确认步距")
+            return
+        # step / count 阶段：左键无操作（Enter 推进）
+
+    def _pattern_reference_point(self):
+        """阵列基准点：第一个选中实体的几何中心。"""
+        for eid in state.pattern_pending:
+            e = self._entity_by_id(eid)
+            if e is None:
+                continue
+            t = e.get("type")
+            if t == "line":
+                return ((e["p1"][0] + e["p2"][0]) / 2.0,
+                        (e["p1"][1] + e["p2"][1]) / 2.0)
+            if t in ("circle", "arc"):
+                return (e["center"][0], e["center"][1])
+        return None
+
+    def _pattern_mouse_step(self):
+        """step 阶段鼠标驱动步距现算（数值缓冲优先时不用）。
+
+        线性 = (鼠标 - 基准点) 在参照线方向上的带符号投影；
+        圆形 = 鼠标方位角相对基准点方位角的带符号差（归一化到
+        (-π, π]，鼠标驱动按近邻意图）。
+        """
+        if state.mouse_2d is None:
+            return None
+        axis = self._entity_by_id(state.pattern_axis)
+        ref = self._pattern_reference_point()
+        if axis is None or ref is None:
+            return None
+        m = state.mouse_2d
+        if state.pattern_kind == 'linear':
+            dx = axis["p2"][0] - axis["p1"][0]
+            dy = axis["p2"][1] - axis["p1"][1]
+            length = math.hypot(dx, dy)
+            if length < 1e-9:
+                return None
+            return ((m[0] - ref[0]) * dx + (m[1] - ref[1]) * dy) / length
+        c = axis["center"]
+        raw = (math.atan2(m[1] - c[1], m[0] - c[0])
+               - math.atan2(ref[1] - c[1], ref[0] - c[0]))
+        return (raw + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _pattern_buffered_step(self):
+        if not state.input_buffer:
+            return None
+        try:
+            v = float(state.input_buffer)
+        except ValueError:
+            return None
+        return v if abs(v) > 1e-9 else None
+
+    def _pattern_buffered_count(self):
+        if not state.input_buffer:
+            return None
+        try:
+            v = int(float(state.input_buffer))
+        except ValueError:
+            return None
+        return v if v >= 2 else None
+
+    def _pattern_copies(self, ents, axis, step, count):
+        """按参照类型生成全部副本实体 dict（不含原件）。"""
+        out = []
+        if state.pattern_kind == 'linear':
+            direction = (axis["p2"][0] - axis["p1"][0],
+                         axis["p2"][1] - axis["p1"][1])
+            for e in ents:
+                out.extend(mp.linear_pattern(e, direction, step, count))
+        else:
+            c = axis["center"]
+            for e in ents:
+                out.extend(mp.circular_pattern(e, c, step, count))
+        return out
+
+    def _update_pattern_preview(self):
+        """step 阶段单副本预览；count 阶段全量副本预览。"""
+        ents = [self._entity_by_id(eid) for eid in state.pattern_pending]
+        axis = self._entity_by_id(state.pattern_axis)
+        if (not ents or any(e is None for e in ents) or axis is None
+                or state.pattern_kind is None):
+            state.pattern_preview = None
+            return
+        if state.pattern_stage == 'step':
+            step = self._pattern_buffered_step()
+            if step is None:
+                step = self._pattern_mouse_step()
+            if step is None:
+                state.pattern_preview = None
+                return
+            state.pattern_preview = self._pattern_copies(
+                ents, axis, step, 2)
+            return
+        # count 阶段：份数未输入时按最小 2 份实时预览
+        count = self._pattern_buffered_count() or 2
+        state.pattern_preview = self._pattern_copies(
+            ents, axis, state.pattern_step, count)
+
+    def _confirm_pattern_step(self):
+        if state.pattern_stage != 'step':
+            return
+        step = self._pattern_buffered_step()
+        if step is None:
+            step = self._pattern_mouse_step()
+        if step is None or abs(step) < 1e-9:
+            self.report({'WARNING'},
+                        "阵列：步距无效——移动鼠标预览或输入数值"
+                        "后回车")
+            return
+        state.pattern_step = step
+        state.input_buffer = ""
+        state.pattern_stage = 'count'
+        self._update_pattern_preview()
+        self.report({'INFO'}, "阵列：输入份数（≥2，含原件）后回车生成")
+
+    def _confirm_pattern(self):
+        if state.pattern_stage != 'count' or state.pattern_step is None:
+            return
+        count = self._pattern_buffered_count()
+        if count is None:
+            self.report({'WARNING'}, "阵列：份数须为 ≥2 的整数（含原件）")
+            return
+        ents = [self._entity_by_id(eid) for eid in state.pattern_pending]
+        axis = self._entity_by_id(state.pattern_axis)
+        if (not ents or any(e is None for e in ents) or axis is None):
+            return
+        copies = self._pattern_copies(
+            ents, axis, state.pattern_step, count)
+        if not copies:
+            self.report({'WARNING'},
+                        "阵列：无法生成副本（步距或方向退化）")
+            return
+        self._push_undo()
+        for d in copies:
+            mp.add_entity_copy(state.sketch, d)
+        state.pattern_pending = []
+        state.pattern_axis = None
+        state.pattern_kind = None
+        state.pattern_stage = 'pick'
+        state.pattern_step = None
+        state.pattern_preview = None
+        state.input_buffer = ""
+        self._refresh_dof()
+        self.report({'INFO'},
+                    f"阵列完成：{count} 份 × {len(ents)} 实体"
+                    "（独立副本）")
+
+    def _esc_pattern(self):
+        s = state
+        if s.pattern_stage == 'count':
+            s.pattern_stage = 'step'
+            s.input_buffer = ""
+            s.pattern_preview = None
+        elif s.pattern_stage == 'step':
+            s.pattern_stage = 'axis'
+            s.pattern_axis = None
+            s.pattern_kind = None
+            s.pattern_step = None
+            s.input_buffer = ""
+            s.pattern_preview = None
+        elif s.pattern_stage == 'axis':
+            s.pattern_stage = 'pick'
+        else:  # pick：选集非空先清空，空则退出工具
+            if s.pattern_pending:
+                s.pattern_pending = []
+            else:
+                s.tool = None
+                self.report({'INFO'}, "SketchCAD：编辑工具已退出")
+
     def _confirm_segment(self, context, p2):
         """确认连续段：推断水平/垂直并吸附，写入实体与自动约束。
 
@@ -818,6 +1294,16 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         state.extend_preview = None
         state.offset_pending = None
         state.offset_preview = None
+        state.mirror_pending = []
+        state.mirror_stage = None
+        state.mirror_axis = None
+        state.mirror_preview = None
+        state.pattern_pending = []
+        state.pattern_stage = None
+        state.pattern_axis = None
+        state.pattern_kind = None
+        state.pattern_step = None
+        state.pattern_preview = None
         state.mode = "select" if state.mode == "draw" else "draw"
         state.selected_entity = None
         state.input_buffer = ""
@@ -978,6 +1464,12 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             if "." not in state.input_buffer:
                 state.input_buffer = (state.input_buffer or "0") + "."
             return True
+        if key_type in ('MINUS', 'NUMPAD_MINUS'):
+            # 负号仅用于带符号输入（阵列步距/角度）；尺寸输入的负值
+            # 由 _apply_dimension 的 value<=0 校验拒绝
+            if not state.input_buffer.startswith('-'):
+                state.input_buffer = '-' + state.input_buffer
+            return True
         if key_type == 'BACKSPACE':
             state.input_buffer = state.input_buffer[:-1]
             return True
@@ -1045,9 +1537,11 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         n_curve = sum(1 for e in sketch.entities
                       if e.get("type") in ("circle", "arc"))
         self._cleanup(context)
-        self.report({'INFO'},
-                    f"草图完成：{count} 个点 / {n_line} 条线段"
-                    + (f" / {n_curve} 个圆弧" if n_curve else ""))
+        msg = (f"草图完成：{count} 个点 / {n_line} 条线段"
+               + (f" / {n_curve} 个圆弧" if n_curve else ""))
+        if not (sketch.host or {}).get("object"):
+            msg += "（断开关联草图：仅保存数据，未提交 mesh）"
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
     def _commit(self, context):
@@ -1055,11 +1549,8 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         if not state.points_2d and not entities:
             return 0
 
-        obj = context.active_object
-        if obj is None or obj.type != 'MESH':
-            return 0
-
-        # 1. 数据层：容器对象 JSON（新建或更新）
+        # 1. 数据层：容器对象 JSON（新建或更新）——不依赖活动对象，
+        #    独立打开（无宿主）时这是唯一持久化路径
         if state.container_name:
             if not manager.update_container(state.container_name, state.sketch):
                 cont = manager.create_container(context, state.sketch)
@@ -1070,7 +1561,16 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             cont = manager.create_container(context, state.sketch)
             state.container_name = cont.name
 
-        # 2. mesh 提交（替换式）：重进续画后再退出时，先按上一轮提交
+        # 2. mesh 提交前置检查：断开关联的草图无宿主（§9 所有权边界
+        #    ——无提交目标，仅保存数据）；活动对象须为宿主 mesh
+        if not (state.sketch.host or {}).get("object"):
+            return 0
+
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            return 0
+
+        # 3. mesh 提交（替换式）：重进续画后再退出时，先按上一轮提交
         #    快照删除宿主 mesh 中的旧轮廓边，再提交当前几何——否则
         #    尺寸修改后新边与旧边不重合，"原来的草图"会残留成双影。
         #    旧边被建模引用（关联面）或已被手动编辑时保留并提示，
@@ -1187,6 +1687,15 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             except Exception:
                 pass
             state.draw_handler = None
+
+        # 宿主 ghost 恢复（引用即取即用：按名取回，不长期持有）
+        if state.host_obj_name and state.host_display_type is not None:
+            host_obj = bpy.data.objects.get(state.host_obj_name)
+            if host_obj is not None:
+                host_obj.display_type = state.host_display_type
+        state.host_obj_name = None
+        state.host_display_type = None
+        state.aid_points = []
 
         rv3d = context.region_data
         if rv3d is not None and state.view_rot is not None:

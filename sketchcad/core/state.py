@@ -43,6 +43,19 @@ class SketchSession:
         self.extend_preview = None  # 延伸预览 (pos, from_pt, to_pt) 或 None
         self.offset_pending = None  # offset 两段式：已选待偏移的实体 id（None=未选）
         self.offset_preview = None  # 偏移预览 dict：kind=profile/circle/arc 或 None
+        self.mirror_pending = []    # mirror：已选实体 id 列表（pick 阶段点击累加）
+        self.mirror_stage = None    # mirror 阶段：'pick' / 'axis' / 'confirm'
+        self.mirror_axis = None     # 镜像轴 line 实体 id（axis/confirm 阶段非 None）
+        self.mirror_preview = None  # 镜像预览实体 dict 列表（confirm 阶段非 None）
+        self.pattern_pending = []   # pattern：已选实体 id 列表
+        self.pattern_stage = None   # pattern 阶段：'pick' / 'axis' / 'step' / 'count'
+        self.pattern_axis = None    # 阵列参照实体 id（line=线性方向 / circle/arc=圆形中心）
+        self.pattern_kind = None    # 'linear' / 'circular'（axis 选中后确定）
+        self.pattern_step = None    # 已确认步距（线性=间距带符号；圆形=弧度增量带符号）
+        self.pattern_preview = None # 阵列预览实体 dict 列表（step=单副本 / count=全量）
+        self.aid_points = []        # 宿主顶点投影辅助点 [(u, v), ...]（进入时固化）
+        self.host_obj_name = None   # 宿主对象名（ghost 恢复用，引用即取即用）
+        self.host_display_type = None  # 进入前宿主 display_type 快照（退出恢复）
         self.constraint_scroll_start = 0  # N-Panel 约束列表滚动起始索引（滚轮驱动）
         self.constraint_follow = True     # 跟随最新约束（滚回底部自动恢复）
         self.draw_handler = None

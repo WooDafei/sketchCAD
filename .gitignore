@@ -5,3 +5,5 @@ archive/
 .arts/
 .codeartsdoer/
 .pytest_cache/
+# 冒烟脚本运行产物（运行时生成）
+tests/smoke_result.json

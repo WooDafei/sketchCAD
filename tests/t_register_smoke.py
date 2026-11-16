@@ -38,6 +38,10 @@ try:
     # 改由 Scene 的 PointerProperty 属性间接验证——PointerProperty
     # 注册时已校验 Settings -> CollectionProperty(Item) 引用链
     RESULTS["prop_group"] = hasattr(bpy.types.Scene, "sketchcad_settings")
+    # 独立打开入口（Phase 3 §2）：operator 的 container_name 属性注册
+    op_rna = bpy.ops.sketch.face_driven_sketch.get_rna_type()
+    RESULTS["open_container_prop"] = "container_name" in {
+        p.identifier for p in op_rna.properties}
 except Exception as e:
     RESULTS["errors"].append(f"{type(e).__name__}: {e}")
 
