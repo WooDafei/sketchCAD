@@ -16,7 +16,13 @@ import math
 
 import bpy
 
+from bpy_extras.view3d_utils import (
+    location_3d_to_region_2d,
+    region_2d_to_origin_3d,
+    region_2d_to_vector_3d,
+)
 from gpu_extras.batch import batch_for_shader
+from mathutils.geometry import intersect_line_plane
 
 from ..core import geom
 from ..core.state import state
@@ -28,9 +34,10 @@ _MODE_HINT = {
     "draw": ("LMB: add point / place circle & arc | 2xLMB / Enter: "
              "end polyline | L/C/A: line/circle/arc | RMB: undo | "
              "Tab / S: select | ESC: finish & commit"),
-    "select": ("LMB: pick entity / drag endpoint or center to solve | "
-               "type number + Enter: dimension | T: trim | E: extend | "
-               "Tab / S: draw | ESC: deselect / finish"),
+    "select": ("LMB: pick | Shift+click: toggle select | drag on "
+               "empty: box select | drag endpoint or center to solve | "
+               "number + Enter: dimension | DEL: delete | T: trim | "
+               "E: extend | Tab / S: draw | ESC: deselect / finish"),
 }
 
 _TOOL_HINT = {
@@ -69,6 +76,9 @@ _COLOR_SNAP_AID = (0.7, 0.4, 1.0, 1.0)
 _COLOR_AID = (0.55, 0.55, 0.62, 0.65)
 _COLOR_CENTER_MARK = (0.75, 0.75, 0.75, 0.85)
 _COLOR_SELECTED = (1.0, 0.5, 0.1, 1.0)
+_COLOR_SELECTED_SUB = (1.0, 0.7, 0.35, 0.9)
+_COLOR_BOX_FILL = (0.2, 0.55, 1.0, 0.12)
+_COLOR_BOX_EDGE = (0.35, 0.65, 1.0, 0.9)
 
 _CROSS_SIZE = 0.2
 
@@ -276,30 +286,18 @@ def draw_sketch():
         batch.draw(shader)
         gpu.state.point_size_set(8.0)
 
-    # 2.5 选中实体高亮（select 模式，加粗橙色）
-    if state.selected_entity is not None:
-        for e in state.sketch.entities:
-            if e.get("id") != state.selected_entity:
+    # 2.5 选集高亮（select 模式）：主选中亮橙加粗，其余选中次橙；
+    # 单选场景只有一个（原行为），多选/框选后逐实体渲染
+    if state.selected_entities:
+        for eid in state.selected_entities:
+            e = _entity_by_id(state.sketch.entities, eid)
+            if e is None:
                 continue
-            t = e.get("type")
-            if t == "line":
-                gpu.state.line_width_set(4.5)
-                batch = batch_for_shader(shader, 'LINES', {"pos": [
-                    d.to_world(e["p1"][0], e["p1"][1]),
-                    d.to_world(e["p2"][0], e["p2"][1])]})
-                shader.bind()
-                shader.uniform_float("color", _COLOR_SELECTED)
-                batch.draw(shader)
-                gpu.state.line_width_set(2.5)
-            elif t == "circle":
-                _draw_line_strip(shader, d, _strip_coords(
-                    d, e["center"], e["radius"], 0.0, geom.TWO_PI),
-                    _COLOR_SELECTED, width=4.5)
-            elif t == "arc":
-                _draw_line_strip(shader, d, _strip_coords(
-                    d, e["center"], e["radius"], e["a1"], e["a2"]),
-                    _COLOR_SELECTED, width=4.5)
-            break
+            main = eid == state.selected_entity
+            _draw_entity_preview(
+                shader, d, e,
+                _COLOR_SELECTED if main else _COLOR_SELECTED_SUB,
+                width=4.5 if main else 3.5)
 
     # 3. 橡皮筋：进行中笔划的末点 -> 鼠标候选点（黄色）
     if (state.mode == "draw" and state.draw_tool == "line"
@@ -451,6 +449,42 @@ def draw_sketch():
         if state.pattern_preview:
             for e in state.pattern_preview:
                 _draw_entity_preview(shader, d, e, _COLOR_RUBBER)
+
+    # 3.9 框选矩形（select 模式空白处拖动）：按下/当前屏幕坐标经
+    # 射线与基准面求交转 2D，四角 to_world 以基准面轴对齐矩形绘制
+    # （与 entities_in_box 的 2D 判定同一语义）；半透明填充 + 边框
+    if (state.box_select_start is not None
+            and state.box_select_cur is not None):
+        rv3d = bpy.context.region_data
+        region = bpy.context.region
+        if rv3d is not None and region is not None:
+            corners_2d = []
+            for sx, sy in (state.box_select_start, state.box_select_cur):
+                ro = region_2d_to_origin_3d(region, rv3d, (sx, sy))
+                rv = region_2d_to_vector_3d(region, rv3d, (sx, sy))
+                hit = intersect_line_plane(
+                    ro, ro + rv, d.origin, d.normal)
+                if hit is None:
+                    corners_2d = None
+                    break
+                corners_2d.append(d.to_2d(hit))
+            if corners_2d is not None:
+                (x1, y1), (x2, y2) = corners_2d
+                quad_2d = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+                quad_w = [d.to_world(u, v) for u, v in quad_2d]
+                tris = [quad_w[0], quad_w[1], quad_w[2],
+                        quad_w[0], quad_w[2], quad_w[3]]
+                batch = batch_for_shader(shader, 'TRIS', {"pos": tris})
+                shader.bind()
+                shader.uniform_float("color", _COLOR_BOX_FILL)
+                batch.draw(shader)
+                edges = []
+                for i in range(4):
+                    edges += [quad_w[i], quad_w[(i + 1) % 4]]
+                batch = batch_for_shader(shader, 'LINES', {"pos": edges})
+                shader.bind()
+                shader.uniform_float("color", _COLOR_BOX_EDGE)
+                batch.draw(shader)
 
     # 4. 确认点（黄白，画线笔划）
     if state.points_2d:

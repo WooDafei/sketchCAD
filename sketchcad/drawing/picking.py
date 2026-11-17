@@ -6,9 +6,13 @@
 Phase 3 圆弧：pick_entity 统一命中 line/circle/arc（select 模式
 选择）；trim/extend 工具仍用 pick_segment（仅 line，MVP 边界）。
 pick_endpoint 扩展 arc 两端点与 circle 圆心（pos=2，拖动圆心用）。
+
+Phase 4 框选：entities_in_box 按实体与矩形相交判定选集——line 用
+Liang-Barsky 线段裁剪，circle 用圆-矩形最近点距离，arc 折线采样后
+逐段走 line 判定（相交即选中，Blender 框选惯例）。
 """
 
-from ..core.geom import arc_point, point_arc_distance
+from ..core.geom import arc_point, arc_points, point_arc_distance
 
 SELECT_PIXEL_TOL = 12.0
 
@@ -103,3 +107,80 @@ def pick_endpoint(point, entities, tol):
                 best_dist = d
                 best = (e["id"], pos)
     return best
+
+# ---- Phase 4 框选：实体与轴对齐矩形相交判定 ----
+
+def segment_intersects_rect(p1, p2, rmin, rmax):
+    """线段与轴对齐矩形 [rmin, rmax] 是否相交（Liang-Barsky 裁剪）。
+
+    任一端点在矩形内直接判 True；否则线段与矩形四边求交存在
+    可见区间即 True。矩形坐标须已归一化（rmin <= rmax）。
+    """
+    def inside(p):
+        return (rmin[0] <= p[0] <= rmax[0]
+                and rmin[1] <= p[1] <= rmax[1])
+
+    if inside(p1) or inside(p2):
+        return True
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, p1[0] - rmin[0]), (dx, rmax[0] - p1[0]),
+                 (-dy, p1[1] - rmin[1]), (dy, rmax[1] - p1[1])):
+        if p == 0.0:
+            if q < 0.0:
+                return False
+        else:
+            t = q / p
+            if p < 0.0:
+                if t > t1:
+                    return False
+                if t > t0:
+                    t0 = t
+            else:
+                if t < t0:
+                    return False
+                if t < t1:
+                    t1 = t
+    return True
+
+
+def circle_intersects_rect(center, radius, rmin, rmax):
+    """圆与轴对齐矩形是否相交：圆心到矩形的最近点距离 <= 半径。
+
+    圆心在矩形内时最近点即圆心本身（距离 0），整圆含于矩形与
+    圆含矩形两种包含情形均判相交（框选语义：碰到即选中）。
+    """
+    cx = max(rmin[0], min(center[0], rmax[0]))
+    cy = max(rmin[1], min(center[1], rmax[1]))
+    return (center[0] - cx) ** 2 + (center[1] - cy) ** 2 <= radius * radius
+
+
+# 弧框选采样的角步长（弧度）：比绘制离散（~2°）粗，框选判定够用
+_BOX_ARC_STEP = 0.25
+
+
+def entities_in_box(rmin, rmax, entities):
+    """返回与矩形相交的实体 id 列表（保持实体数组顺序）。
+
+    line：Liang-Barsky；circle：圆-矩形相交；arc：折线采样逐段
+    走 line 判定（采样步长 0.25 rad，端点必含）。construction
+    实体同样参与框选（与点击拾取语义一致）。
+    """
+    out = []
+    for e in entities:
+        t = e.get("type")
+        if t == "line":
+            if segment_intersects_rect(e["p1"], e["p2"], rmin, rmax):
+                out.append(e["id"])
+        elif t == "circle":
+            if circle_intersects_rect(e["center"], e["radius"],
+                                      rmin, rmax):
+                out.append(e["id"])
+        elif t == "arc":
+            pts = arc_points(e["center"], e["radius"], e["a1"], e["a2"],
+                             max_step=_BOX_ARC_STEP)
+            if any(segment_intersects_rect(pts[i], pts[i + 1], rmin, rmax)
+                   for i in range(len(pts) - 1)):
+                out.append(e["id"])
+    return out

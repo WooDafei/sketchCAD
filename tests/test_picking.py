@@ -133,3 +133,62 @@ def test_pick_endpoint_line_and_arc_shared_point():
     ents = [line(1, (0, 0), (4, 0)), arc(2, (2, 0), 2.0, 0.0, math.pi)]
     # 共享端点 (4, 0)：线 1 p2 与弧 2 a1 端 → 先遍历者命中
     assert picking.pick_endpoint((4.05, 0.05), ents, 0.5) == (1, 1)
+
+# ---- Phase 4 框选：entities_in_box 相交判定 ----
+
+def test_segment_intersects_rect_endpoint_inside():
+    assert picking.segment_intersects_rect(
+        (1, 1), (5, 5), (0, 0), (3, 3))
+
+
+def test_segment_intersects_rect_crossing_both_outside():
+    # 两端点都在矩形外但穿越内部（Liang-Barsky 求交路径）
+    assert picking.segment_intersects_rect(
+        (-1, 1.5), (4, 1.5), (0, 0), (3, 3))
+
+
+def test_segment_intersects_rect_miss():
+    assert not picking.segment_intersects_rect(
+        (-3, 5), (-1, 5), (0, 0), (3, 3))
+    # 与边平行但在矩形外侧
+    assert not picking.segment_intersects_rect(
+        (4, 0), (6, 0), (0, 0), (3, 3))
+
+
+def test_circle_intersects_rect_various():
+    # 圆心在矩形内
+    assert picking.circle_intersects_rect((1, 1), 0.5, (0, 0), (3, 3))
+    # 与右边相交：最近点 (3, 1) 距圆心 0.5 < r
+    assert picking.circle_intersects_rect((3.5, 1), 0.6, (0, 0), (3, 3))
+    # 完全在外
+    assert not picking.circle_intersects_rect((5, 5), 1.0, (0, 0), (3, 3))
+    # 矩形完全含于圆：圆心在内距离 0 <= r，判相交（碰到即选中）
+    assert picking.circle_intersects_rect((1.5, 1.5), 10.0, (0, 0), (3, 3))
+
+
+def test_entities_in_box_order_and_filter():
+    import math
+    ents = [line(1, (0, 0), (10, 0)),
+            circle(2, (5, 5), 2.0),
+            arc(3, (5, 15), 2.0, 0.0, math.pi)]
+    # 矩形只碰线 1（圆心 (5,5) 到矩形最近点 (5,1) 距 4 > r）
+    assert picking.entities_in_box((4, -1), (6, 1), ents) == [1]
+    # 矩形只含圆 2（线 1 y=0 在外，弧 3 下缘 y>=13 在外）
+    assert picking.entities_in_box((3, 3), (7, 7), ents) == [2]
+    # 覆盖全部
+    assert picking.entities_in_box((-1, -1), (8, 18), ents) == [1, 2, 3]
+
+
+def test_entities_in_box_arc_via_endpoint():
+    import math
+    ents = [arc(1, (0, 0), 2.0, 0.0, math.pi / 2)]
+    # a1 端点 (2, 0) 落在矩形内（弧采样折线含端点）
+    assert picking.entities_in_box((1.9, -0.5), (2.5, 0.5), ents) == [1]
+    # 矩形远离弧体（弧在 x>=0/y>=0 象限，r=2）
+    assert picking.entities_in_box((-2.5, -2.5), (-1.5, -1.5), ents) == []
+
+
+def test_entities_in_box_skips_unknown_type():
+    ents = [{"id": 9, "type": "mystery", "p1": [0, 0]},
+            line(1, (0, 0), (5, 5))]
+    assert picking.entities_in_box((0, 0), (2, 2), ents) == [1]

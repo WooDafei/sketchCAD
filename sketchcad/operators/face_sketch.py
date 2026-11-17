@@ -103,6 +103,9 @@ _DRAG_SOLVE_INTERVAL = 1.0 / 60.0
 # §8 快照栈深度上限（防长时间会话内存膨胀）
 _UNDO_LIMIT = 100
 
+# 框选矩形最小对角线（像素）：低于视为点击空白（不启动框选判定）
+_BOX_MIN_PIXELS = 5.0
+
 
 class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
     """基于选中面进入 SketchCAD 草图模式（container_name 指定时为独立打开入口）"""
@@ -256,9 +259,11 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         context.window_manager.modal_handler_add(self)
         self.report({'INFO'},
                     "SketchCAD 草图模式 | 画线: 左键加点, 双击/Enter 结束"
-                    " | L/C/A 切直线/圆/弧 | Tab 选择模式(输数值+回车"
-                    "定尺寸, T 修剪, E 延伸, O 偏移, M 镜像, P 阵列) | "
-                    "右键/Ctrl+Z 撤销, Ctrl+Shift+Z 重做 | ESC 提交退出")
+                    " | L/C/A 切直线/圆/弧 | Tab 选择模式(点击选中, "
+                    "Shift+点击加/减选, 空白拖动框选, DEL 删除, 输数值"
+                    "+回车定尺寸, T 修剪, E 延伸, O 偏移, M 镜像, "
+                    "P 阵列) | 右键/Ctrl+Z 撤销, Ctrl+Shift+Z 重做 | "
+                    "ESC 提交退出")
         return {'RUNNING_MODAL'}
 
     def _align_view(self, context, datum):
@@ -303,6 +308,9 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
 
         if event.type == 'MOUSEMOVE':
             self._update_mouse(context, event)
+            if state.box_select_start is not None:
+                state.box_select_cur = (
+                    event.mouse_region_x, event.mouse_region_y)
             if state.dragging is not None:
                 self._drag_update()
             if state.extend_pending is not None:
@@ -359,12 +367,14 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                     elif state.tool == 'pattern':
                         self._apply_pattern(context)
                     else:
-                        self._press_select(context, state.mouse_2d)
+                        self._press_select(context, event, state.mouse_2d)
                 else:
                     self._press_draw(context, state.mouse_2d)
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            if state.box_select_start is not None:
+                self._finish_box_select(context)
             if state.dragging is not None:
                 dragged = state.drag_undo_pushed
                 state.dragging = None
@@ -421,6 +431,12 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             self._redo()
             return {'RUNNING_MODAL'}
 
+        if (event.type == 'DEL' and event.value == 'PRESS'
+                and state.mode == "select" and state.tool is None
+                and state.selected_entities):
+            self._delete_selection()
+            return {'RUNNING_MODAL'}
+
         if ((event.type == 'RIGHTMOUSE' or (event.type == 'Z' and event.ctrl))
                 and event.value == 'PRESS'):
             self._undo()
@@ -450,10 +466,13 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                 self._cancel_curve_pending()
                 return {'RUNNING_MODAL'}
             if state.mode == "select" and (
-                    state.selected_entity is not None or state.input_buffer):
-                # 先清选中/取消输入，再按一次 ESC 才退出草图
-                state.selected_entity = None
+                    state.selected_entities or state.input_buffer
+                    or state.box_select_start is not None):
+                # 先清选集/输入/取消框选，再按一次 ESC 才退出草图
+                self._clear_selection()
                 state.input_buffer = ""
+                state.box_select_start = None
+                state.box_select_cur = None
                 return {'RUNNING_MODAL'}
             return self._finish(context)
 
@@ -549,6 +568,7 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         state.points_2d = list(snap["points_2d"])
         state.stroke_open = snap["stroke_open"]
         state.selected_entity = None
+        state.selected_entities = []
         state.input_buffer = ""
         state.dragging = None
         # 撤销/重做后清除未完成的圆/弧绘制状态（快照不含进行中预览）
@@ -572,6 +592,7 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
     def _toggle_tool(self, tool):
         state.tool = None if state.tool == tool else tool
         state.selected_entity = None
+        state.selected_entities = []
         state.input_buffer = ""
         state.extend_pending = None
         state.extend_preview = None
@@ -1306,6 +1327,7 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         state.pattern_preview = None
         state.mode = "select" if state.mode == "draw" else "draw"
         state.selected_entity = None
+        state.selected_entities = []
         state.input_buffer = ""
         state.solve_failed = False
         state.dragging = None
@@ -1390,18 +1412,41 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         state.sketch.add_arc(center, r, a1, a2)
         self._refresh_dof()
 
-    def _select_at(self, context, p):
-        tol = picking.SELECT_PIXEL_TOL * self._world_per_pixel(context)
-        state.selected_entity = picking.pick_entity(
-            p, state.sketch.entities, tol)
+    def _clear_selection(self):
+        """清空选集（主选中一并清除）。"""
+        state.selected_entities = []
+        state.selected_entity = None
+
+    def _toggle_entity_selection(self, eid):
+        """Shift+点击 toggle：已在选集则移出，否则加入并设为主选中。"""
+        if eid in state.selected_entities:
+            state.selected_entities.remove(eid)
+            if state.selected_entity == eid:
+                state.selected_entity = (
+                    state.selected_entities[-1]
+                    if state.selected_entities else None)
+        else:
+            state.selected_entities.append(eid)
+            state.selected_entity = eid
         state.input_buffer = ""
         state.solve_failed = False
 
-    def _press_select(self, context, p):
-        """select 模式按下：端点/圆心命中则进入拖动求解，否则选实体。"""
+    def _press_select(self, context, event, p):
+        """select 模式按下（Phase 4 选集重构）。
+
+        端点/圆心命中：Shift 按下时 toggle 选中所属实体（不进入
+        拖动），否则进入拖动求解并把所属实体纳入选集；空白处按下
+        一律先记框选起点——RELEASE 时矩形过小视为点击空白（Shift
+        保持选集、否则清空），拖动超阈值即为框选。框选与拖动求解
+        天然互斥：命中特征按下永不启动框选。
+        """
+        shift = bool(event.shift)
         tol = picking.SELECT_PIXEL_TOL * self._world_per_pixel(context)
         hit = picking.pick_endpoint(p, state.sketch.entities, tol)
         if hit is not None:
+            if shift:
+                self._toggle_entity_selection(hit[0])
+                return
             # 拖动快照延迟到实际移动时 push：纯点击（端点/圆心命中）
             # 仅选中，不污染 undo 栈；按住拖动才回退到拖动前
             state.dragging = hit
@@ -1409,8 +1454,76 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             state.solve_failed = False
             state.drag_last_solve = 0.0
             state.drag_undo_pushed = False
+            if hit[0] not in state.selected_entities:
+                state.selected_entities.append(hit[0])
+            return
+        state.box_select_start = (
+            event.mouse_region_x, event.mouse_region_y)
+        state.box_select_cur = state.box_select_start
+        state.box_select_shift = shift
+
+    def _finish_box_select(self, context):
+        """框选完成：屏幕矩形转基准面 2D 矩形按相交判定更新选集。
+
+        矩形过小（<_BOX_MIN_PIXELS 对角线）视为点击空白：Shift
+        保持选集不动，否则清空。Shift 框选为加选（并集），普通框
+        选为替换；替换后主选中取选集最后一个（尺寸输入归属明确）。
+        """
+        sx, sy = state.box_select_start
+        cx, cy = state.box_select_cur or (sx, sy)
+        state.box_select_start = None
+        state.box_select_cur = None
+        shift = state.box_select_shift
+        state.box_select_shift = False
+        if ((cx - sx) ** 2 + (cy - sy) ** 2) ** 0.5 < _BOX_MIN_PIXELS:
+            if not shift:
+                self._clear_selection()
+            return
+        region = context.region
+        rv3d = context.region_data
+        if region is None or rv3d is None:
+            return
+        d = state.datum
+        pts_2d = []
+        for px, py in ((sx, sy), (cx, cy)):
+            ro = region_2d_to_origin_3d(region, rv3d, (px, py))
+            rv = region_2d_to_vector_3d(region, rv3d, (px, py))
+            hit = intersect_line_plane(ro, ro + rv, d.origin, d.normal)
+            if hit is None:
+                return
+            pts_2d.append(d.to_2d(hit))
+        (x1, y1), (x2, y2) = pts_2d
+        rmin = (min(x1, x2), min(y1, y2))
+        rmax = (max(x1, x2), max(y1, y2))
+        picked = picking.entities_in_box(rmin, rmax,
+                                         state.sketch.entities)
+        if shift:
+            for eid in picked:
+                if eid not in state.selected_entities:
+                    state.selected_entities.append(eid)
         else:
-            self._select_at(context, p)
+            state.selected_entities = list(picked)
+            state.selected_entity = picked[-1] if picked else None
+        if picked:
+            self.report({'INFO'},
+                        f"框选{'加选' if shift else '选中'} "
+                        f"{len(picked)} 个实体"
+                        f"（选集 {len(state.selected_entities)}）")
+
+    def _delete_selection(self):
+        """删除选集全部实体（级联约束），一次 undo 快照覆盖整批。"""
+        eids = [eid for eid in state.selected_entities
+                if self._entity_by_id(eid) is not None]
+        if not eids:
+            return
+        self._push_undo()
+        for eid in eids:
+            state.sketch.remove_entity_and_constraints(eid)
+        self._clear_selection()
+        self._refresh_dof()
+        self.report({'INFO'},
+                    f"已删除 {len(eids)} 个实体"
+                    "（级联约束同步移除）")
 
     def _drag_update(self):
         """拖动实时求解（节流 ~60Hz；失败时保持上次成功几何）。

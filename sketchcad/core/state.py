@@ -30,7 +30,11 @@ class SketchSession:
         self.arc_p1 = None          # 弧绘制：起点（三点式第一点）
         self.arc_p2 = None          # 弧绘制：弧上中间点（三点式第二点）
         self.tool = None            # select 模式编辑工具：None / 'trim' / 'extend'
-        self.selected_entity = None # select 模式选中的线段实体 id
+        self.selected_entity = None # select 模式主选中实体 id（尺寸输入/N-Panel 用）
+        self.selected_entities = [] # select 模式选集（id 列表，按选中顺序；主选中含于其中）
+        self.box_select_start = None  # 框选：按下屏幕坐标 (x, y)；None=未在框选中
+        self.box_select_shift = False # 框选按下时 Shift 是否按下（加选/替换语义）
+        self.box_select_cur = None    # 框选：鼠标当前区域坐标（绘制预览用）
         self.input_buffer = ""      # 尺寸数值输入缓冲（select 模式）
         self.solve_failed = False   # 上次求解失败标记（HUD 红色提示，成功/切换时清除）
         self.dragging = None        # 拖动求解中的端点 (entity_id, pos)；None = 未拖动

@@ -165,6 +165,12 @@ class SKETCHCAD_PT_main(bpy.types.Panel):
         sketch = state.sketch
         layout.label(text=f"活动草图: {state.container_name}")
 
+        # 多选选集计数（单选详情各行不变，选集 >1 时追加提示行）
+        if len(state.selected_entities) > 1:
+            layout.label(
+                text=f"选集: {len(state.selected_entities)} 个实体"
+                "（DEL 批量删除）", icon='RESTRICT_SELECT_OFF')
+
         ent = None
         if state.selected_entity is not None:
             ent = next((x for x in sketch.entities
