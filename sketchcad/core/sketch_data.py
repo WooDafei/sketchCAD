@@ -19,12 +19,17 @@ Phase 3 起顶层新增可选 "visible" 字段（管理器隐藏/显示，缺省
 Phase 3 圆弧实体（§4 混合草图）：circle 存 center/radius（3 参数），
 arc 存 center/radius/a1/a2（5 参数），弧从 a1 逆时针扫到 a2（方向
 约定见 core/geom.py）；新约束 radius / concentric / tangent。
+
+Phase 4 椭圆实体：ellipse 存 center/a/b/rot（4 参数 + 旋转角），
+长半轴 a >= 短半轴 b（数据层规范化），rot 为长轴方向角、不参与
+求解（MVP 无椭圆专属约束）；多边形不引入新实体类型（生成 N 条
+line + coincident，见 drawing/polygon.py）。
 """
 
 import json
 
 from .datum import Datum
-from .geom import arc_point
+from .geom import arc_point, ellipse_normalize
 
 SCHEMA_VERSION = 1
 PROP_KEY = "SketchCAD_Data"
@@ -73,6 +78,25 @@ class SketchData:
             "radius": float(radius),
             "a1": float(a1),
             "a2": float(a2),
+            "construction": bool(construction),
+        })
+
+    def add_ellipse(self, center, a, b, rot, construction=False):
+        """椭圆实体（4 几何参数 + 旋转）：center/a/b/rot。
+
+        数据层不变式：a >= b（长半轴在前）；b > a 时交换两轴并把
+        rot 转 90°（geom.ellipse_normalize），交互层任意击点顺序
+        都落到一致的存储形态。rot 为长轴方向角（基准面坐标弧度），
+        不参与约束求解（Phase 4 MVP：椭圆自由参数，无专属约束）。
+        """
+        A, B, ROT = geom.ellipse_normalize(float(a), float(b), float(rot))
+        self.entities.append({
+            "id": self._next_id(),
+            "type": "ellipse",
+            "center": [center[0], center[1]],
+            "a": A,
+            "b": B,
+            "rot": ROT,
             "construction": bool(construction),
         })
 

@@ -52,7 +52,7 @@ def collect_candidates(entities, mouse_2d=None, tol=None):
             if mkey not in seen:
                 seen.add(mkey)
                 out.append((m[0], m[1], SNAP_MIDPOINT))
-        elif t in ("circle", "arc"):
+        elif t in ("circle", "arc", "ellipse"):
             c = e["center"]
             ckey = (round(c[0], 6), round(c[1], 6))
             if ckey not in seen:

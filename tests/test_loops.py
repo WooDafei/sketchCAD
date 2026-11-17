@@ -150,3 +150,23 @@ def test_arc_open_not_loop():
     import math
     ents = [arc(1, (2, 0), 2.0, 0.0, math.pi)]
     assert loops.detect_closed_loops(ents) == []
+
+def ellipse(eid, center, a, b, rot):
+    return {"id": eid, "type": "ellipse", "center": list(center),
+            "a": a, "b": b, "rot": rot}
+
+
+def test_ellipse_standalone_loop():
+    # Phase 4：ellipse 本身是闭合轮廓，与 circle 同语义独立成环
+    ents = [
+        mk(1, (0, 0), (4, 0)), mk(2, (4, 0), (4, 4)), mk(3, (4, 4), (0, 0)),
+        ellipse(9, (20, 20), 3.0, 2.0, 0.5),
+    ]
+    result = loops.detect_closed_loops(ents)
+    assert len(result) == 2
+    assert any(loop == [9] for loop in result)
+
+
+def test_zero_size_ellipse_ignored():
+    ents = [ellipse(1, (0, 0), 0.0, 2.0, 0.0)]
+    assert loops.detect_closed_loops(ents) == []

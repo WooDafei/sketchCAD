@@ -26,6 +26,7 @@ from mathutils.geometry import intersect_line_plane
 
 from ..core import geom
 from ..core.state import state
+from ..drawing import polygon as poly
 from ..solver.dof import STATUS_FULL, STATUS_OVER
 from ..snapping import aid_points as aid_pts
 from ..snapping import snap
@@ -61,6 +62,10 @@ _DRAW_TOOL_HINT = {
     "line": "LINE: click to add points, double-click / Enter ends stroke",
     "circle": "CIRCLE: 1st click center, 2nd click radius",
     "arc": "ARC (3-point): click start -> point on arc -> end",
+    "ellipse": ("ELLIPSE: 1st click center, 2nd click major axis end "
+                "(a + rotation), 3rd click minor axis"),
+    "polygon": ("POLYGON: type number + Enter to set sides | 1st click "
+                "center, 2nd click vertex direction"),
 }
 
 _COLOR_CROSS = (0.2, 0.6, 1.0, 1.0)
@@ -89,6 +94,13 @@ def _strip_coords(d, center, radius, a1, a2):
             for p in geom.arc_points(center, radius, a1, a2)]
 
 
+def _strip_coords_ellipse(d, e):
+    """ellipse 实体离散折线的世界坐标序列（闭合，首尾重合）。"""
+    return [d.to_world(p[0], p[1])
+            for p in geom.ellipse_points(e["center"], e["a"], e["b"],
+                                         e["rot"])]
+
+
 def _draw_line_strip(shader, d, coords, color, width=2.5):
     gpu.state.line_width_set(width)
     batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": coords})
@@ -106,7 +118,7 @@ def _entity_by_id(entities, eid):
 
 
 def _draw_entity_preview(shader, d, e, color, width=None):
-    """预览实体绘制（mirror/pattern 生成结果：line/circle/arc）。"""
+    """预览实体绘制（mirror/pattern 生成结果：line/circle/arc/ellipse）。"""
     t = e.get("type")
     if t == "line":
         if width is not None:
@@ -127,6 +139,9 @@ def _draw_entity_preview(shader, d, e, color, width=None):
         _draw_line_strip(shader, d, _strip_coords(
             d, e["center"], e["radius"], e["a1"], e["a2"]), color,
             width=width or 2.5)
+    elif t == "ellipse":
+        _draw_line_strip(shader, d, _strip_coords_ellipse(d, e), color,
+                         width=width or 2.5)
 
 
 def _draw_hud_text():
@@ -144,6 +159,12 @@ def _draw_hud_text():
         blf.draw(font_id, _DRAW_TOOL_HINT.get(
             state.draw_tool, state.draw_tool))
         y += 20
+        if state.draw_tool == "polygon" and state.input_buffer:
+            blf.color(font_id, 1.0, 0.8, 0.3, 1.0)
+            blf.position(font_id, 24, y)
+            blf.draw(font_id,
+                     f"sides: {state.input_buffer}_ (Enter to confirm)")
+            y += 20
 
     if state.tool is not None:
         blf.color(font_id, 1.0, 0.65, 0.15, 1.0)
@@ -248,14 +269,17 @@ def draw_sketch():
             _draw_line_strip(shader, d, _strip_coords(
                 d, e["center"], e["radius"], e["a1"], e["a2"]),
                 _COLOR_LINES)
+        elif t == "ellipse":
+            _draw_line_strip(shader, d, _strip_coords_ellipse(d, e),
+                             _COLOR_LINES)
 
-    # 2.2 圆心常驻标记（circle/arc：灰色小点，点击可选中所属实体；
-    # 选中实体的圆心橙色放大）——点圆心与按住拖动圆心的区分由
-    # operator 层完成（实际移动几何才进入拖动求解）
+    # 2.2 圆心/椭圆中心常驻标记（circle/arc/ellipse：灰色小点，
+    # 点击可选中所属实体；选中实体的中心橙色放大）——点中心与按住
+    # 拖动中心的区分由 operator 层完成（实际移动几何才进入拖动求解）
     center_plain = []
     center_picked = []
     for e in state.sketch.entities:
-        if e.get("type") not in ("circle", "arc"):
+        if e.get("type") not in ("circle", "arc", "ellipse"):
             continue
         c = e["center"]
         (center_picked if state.selected_entity == e.get("id")
@@ -328,6 +352,53 @@ def draw_sketch():
         shader.bind()
         shader.uniform_float("color", _COLOR_RUBBER)
         batch.draw(shader)
+
+    # 3.15 椭圆预览：圆心已定 → 长轴橡皮筋；长轴已定 → 按 b 规范化
+    # 后的最终形态实时预览（与 add_ellipse 数据层同一 normalize）
+    if (state.mode == "draw" and state.draw_tool == "ellipse"
+            and state.ellipse_center is not None
+            and state.mouse_2d is not None):
+        c = state.ellipse_center
+        m = state.mouse_2d
+        if state.ellipse_major is None:
+            rubber = [d.to_world(c[0], c[1]), d.to_world(m[0], m[1])]
+            batch = batch_for_shader(shader, 'LINES', {"pos": rubber})
+            shader.bind()
+            shader.uniform_float("color", _COLOR_RUBBER)
+            batch.draw(shader)
+        else:
+            a, rot = state.ellipse_major
+            b = ((m[0] - c[0]) ** 2 + (m[1] - c[1]) ** 2) ** 0.5
+            A, B, R = geom.ellipse_normalize(a, b, rot)
+            if A > 1e-9:
+                pts_w = [d.to_world(p[0], p[1]) for p in
+                         geom.ellipse_points(c, A, B, R)]
+                _draw_line_strip(shader, d, pts_w, _COLOR_RUBBER)
+
+    # 3.16 多边形预览：中心已定 → 外接圆橡皮筋 + 顶点折线实时预览
+    if (state.mode == "draw" and state.draw_tool == "polygon"
+            and state.polygon_center is not None
+            and state.mouse_2d is not None):
+        c = state.polygon_center
+        m = state.mouse_2d
+        r = ((m[0] - c[0]) ** 2 + (m[1] - c[1]) ** 2) ** 0.5
+        if r > 1e-9:
+            start = math.atan2(m[1] - c[1], m[0] - c[0])
+            verts = poly.polygon_vertices(c, r, start,
+                                          state.polygon_sides)
+            if verts is not None:
+                coords = []
+                for i in range(len(verts)):
+                    nxt = verts[(i + 1) % len(verts)]
+                    coords += [d.to_world(verts[i][0], verts[i][1]),
+                               d.to_world(nxt[0], nxt[1])]
+                batch = batch_for_shader(shader, 'LINES',
+                                         {"pos": coords})
+                shader.bind()
+                shader.uniform_float("color", _COLOR_RUBBER)
+                batch.draw(shader)
+            _draw_line_strip(shader, d, _strip_coords(
+                d, c, r, 0.0, geom.TWO_PI), _COLOR_RUBBER)
 
     # 3.2 弧预览（三点式）：起点 ->（弧上点）-> 鼠标
     if (state.mode == "draw" and state.draw_tool == "arc"

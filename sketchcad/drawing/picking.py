@@ -9,15 +9,32 @@ pick_endpoint 扩展 arc 两端点与 circle 圆心（pos=2，拖动圆心用）
 
 Phase 4 框选：entities_in_box 按实体与矩形相交判定选集——line 用
 Liang-Barsky 线段裁剪，circle 用圆-矩形最近点距离，arc 折线采样后
-逐段走 line 判定（相交即选中，Blender 框选惯例）。
+逐段走 line 判定（相交即选中，Blender 框选惯例）。椭圆拾取同走
+折线采样近似（pick_entity 最近距离 / pick_endpoint 仅圆心 / 框选
+逐段判定），采样精度足以覆盖 12px 拾取容差场景。
 """
 
-from ..core.geom import arc_point, arc_points, point_arc_distance
+from ..core.geom import (
+    arc_point,
+    arc_points,
+    ellipse_points,
+    point_arc_distance,
+)
 
 SELECT_PIXEL_TOL = 12.0
 
 # circle 拖动/拾取的"端点"槽位约定：2 = 圆心（0/1 已被 p1/p2 占用）
 POS_CENTER = 2
+
+# 椭圆拾取/框选采样的角步长（弧度）：折线近似 vs 点到折线距离，
+# 0.15 rad 约 42 段，误差远小于 12px 拾取容差对应的世界距离
+_ELLIPSE_PICK_STEP = 0.15
+
+
+def _ellipse_sample(e):
+    """ellipse 实体的折线采样点序列（含首尾重合闭合点）。"""
+    return ellipse_points(e["center"], e["a"], e["b"], e["rot"],
+                          max_step=_ELLIPSE_PICK_STEP)
 
 
 def point_segment_distance(p, a, b):
@@ -69,6 +86,10 @@ def pick_entity(point, entities, tol):
         elif t == "arc":
             d = point_arc_distance(point, e["center"], e["radius"],
                                    e["a1"], e["a2"])
+        elif t == "ellipse":
+            pts = _ellipse_sample(e)
+            d = min(point_segment_distance(point, pts[i], pts[i + 1])
+                    for i in range(len(pts) - 1))
         else:
             continue
         if d < best_dist or (d <= best_dist and best_id is None):
@@ -98,6 +119,8 @@ def pick_endpoint(point, entities, tol):
                 arc_point(e["center"], e["radius"], e["a2"])
             slots = ((0, p1), (1, p2))
         elif t == "circle":
+            slots = ((POS_CENTER, e["center"]),)
+        elif t == "ellipse":
             slots = ((POS_CENTER, e["center"]),)
         else:
             continue
@@ -180,6 +203,11 @@ def entities_in_box(rmin, rmax, entities):
         elif t == "arc":
             pts = arc_points(e["center"], e["radius"], e["a1"], e["a2"],
                              max_step=_BOX_ARC_STEP)
+            if any(segment_intersects_rect(pts[i], pts[i + 1], rmin, rmax)
+                   for i in range(len(pts) - 1)):
+                out.append(e["id"])
+        elif t == "ellipse":
+            pts = _ellipse_sample(e)
             if any(segment_intersects_rect(pts[i], pts[i + 1], rmin, rmax)
                    for i in range(len(pts) - 1)):
                 out.append(e["id"])

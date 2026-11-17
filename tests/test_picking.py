@@ -192,3 +192,43 @@ def test_entities_in_box_skips_unknown_type():
     ents = [{"id": 9, "type": "mystery", "p1": [0, 0]},
             line(1, (0, 0), (5, 5))]
     assert picking.entities_in_box((0, 0), (2, 2), ents) == [1]
+
+# ---- Phase 4 椭圆拾取（折线采样近似）----
+
+def ellipse(eid, center, a, b, rot):
+    return {"id": eid, "type": "ellipse", "center": list(center),
+            "a": a, "b": b, "rot": rot}
+
+
+def test_pick_entity_ellipse_on_curve():
+    # rot=0、center=(0,0)、a=3：长轴正端 (3, 0) 在椭圆周上
+    ents = [ellipse(1, (0, 0), 3.0, 2.0, 0.0)]
+    assert picking.pick_entity((3.0, 0.0), ents, 0.3) == 1
+    # 椭圆周外：点 (4,0) 到椭圆真实最近距离 1.0（最近点 (3,0)，
+    # f(u)=5u²-24u+20 在 u∈[-1,1] 单调递减，最小即 u=1）
+    assert picking.pick_entity((4.0, 0.0), ents, 1.5) == 1
+    assert picking.pick_entity((4.0, 0.0), ents, 0.5) is None
+
+
+def test_pick_entity_ellipse_nearest_wins():
+    ents = [ellipse(1, (0, 0), 3.0, 2.0, 0.0),
+            ellipse(2, (10, 0), 3.0, 2.0, 0.0)]
+    # 点 (6.6, 0)：距椭圆 1 长轴端 (3,0) 为 3.6，距椭圆 2 端 (7,0) 为 0.4
+    assert picking.pick_entity((6.6, 0.0), ents, 0.5) == 2
+
+
+def test_pick_endpoint_ellipse_center_pos2():
+    ents = [ellipse(1, (5, 5), 3.0, 2.0, 0.0)]
+    assert picking.pick_endpoint((5.2, 4.9), ents, 0.5) == (1, 2)
+    assert picking.pick_endpoint((8.0, 5.0), ents, 0.5) is None
+
+
+def test_entities_in_box_ellipse():
+    ents = [ellipse(1, (0, 0), 3.0, 2.0, 0.0)]
+    # 矩形罩住长轴正端 (3, 0) 附近
+    assert picking.entities_in_box((2.5, -0.5), (3.5, 0.5), ents) == [1]
+    # 远离椭圆的矩形
+    assert picking.entities_in_box((10, 10), (12, 12), ents) == []
+    # 覆盖椭圆中心但远离周线：采样段与矩形相交判定
+    # （矩形 (0,0)-(0.5,0.5) 含中心，椭圆周在远处 → 不命中）
+    assert picking.entities_in_box((0.0, 0.0), (0.5, 0.5), ents) == []

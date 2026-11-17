@@ -2,8 +2,8 @@
 
 纯几何函数，不依赖 bpy。以 line/arc 实体端点坐标（round6 归并，与
 端点匹配/捕捉语义一致）为节点建图：剪去度 <= 1 的开放尾巴后，
-仅由度 = 2 节点构成的连通分量即为简单闭合轮廓。circle 实体本身
-是闭合轮廓，直接独立成环（不进端点图）。
+仅由度 = 2 节点构成的连通分量即为简单闭合轮廓。circle / ellipse
+实体本身是闭合轮廓，直接独立成环（不进端点图）。
 
 MVP 边界：共享端点的分叉（度 > 2，如"8"字形、十字连接）分量
 不识别为闭合轮廓；交点在段中部（非端点）的交叉不构成图节点，
@@ -23,8 +23,8 @@ def detect_closed_loops(entities):
     """检测闭合轮廓。
 
     返回环列表 [[entity_id, ...], ...]，每个环的实体 id 按连接顺序
-    排列（便于后续 offset/挤出按序遍历）；circle 实体单独成环
-    （单元素环）。
+    排列（便于后续 offset/挤出按序遍历）；circle / ellipse 实体
+    单独成环（单元素环）。
     """
     loops = []
     adj = {}  # 端点 key -> [(entity_id, 对端 key), ...]
@@ -32,6 +32,10 @@ def detect_closed_loops(entities):
         t = e.get("type")
         if t == "circle":
             if e.get("radius", 0.0) > 1e-9:
+                loops.append([e["id"]])
+            continue
+        if t == "ellipse":
+            if min(e.get("a", 0.0), e.get("b", 0.0)) > 1e-9:
                 loops.append([e["id"]])
             continue
         if t == "line":

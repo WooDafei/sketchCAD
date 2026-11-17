@@ -65,6 +65,7 @@ from ..core.datum import Datum
 from ..core.state import CONSTRAINT_VISIBLE, CONSTRAINT_WHEEL_STEP, state
 from ..drawing import auto_constraints as ac
 from ..drawing import picking
+from ..drawing import polygon as poly
 from ..editing import commit as cmt
 from ..editing import mirror_pattern as mp
 from ..editing import offset as off
@@ -87,8 +88,9 @@ _PERIOD_KEYS = ('PERIOD', 'NUMPAD_PERIOD')
 _TOOL_KEYS = {'T': 'trim', 'E': 'extend', 'O': 'offset',
               'M': 'mirror', 'P': 'pattern'}
 
-# draw 模式子工具快捷键（L 直线 / C 圆 / A 三点弧）
-_DRAW_TOOL_KEYS = {'L': 'line', 'C': 'circle', 'A': 'arc'}
+# draw 模式子工具快捷键（L 直线 / C 圆 / A 三点弧 / E 椭圆 / N 正多边形）
+_DRAW_TOOL_KEYS = {'L': 'line', 'C': 'circle', 'A': 'arc',
+                   'E': 'ellipse', 'N': 'polygon'}
 
 # 圆/弧绘制的最小尺寸（世界单位），低于视为误击
 _MIN_RADIUS = 1e-4
@@ -259,11 +261,11 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         context.window_manager.modal_handler_add(self)
         self.report({'INFO'},
                     "SketchCAD 草图模式 | 画线: 左键加点, 双击/Enter 结束"
-                    " | L/C/A 切直线/圆/弧 | Tab 选择模式(点击选中, "
-                    "Shift+点击加/减选, 空白拖动框选, DEL 删除, 输数值"
-                    "+回车定尺寸, T 修剪, E 延伸, O 偏移, M 镜像, "
-                    "P 阵列) | 右键/Ctrl+Z 撤销, Ctrl+Shift+Z 重做 | "
-                    "ESC 提交退出")
+                    " | L/C/A/E/N 切直线/圆/弧/椭圆/多边形(数字定边数)"
+                    " | Tab 选择模式(点击选中, Shift+点击加/减选, 空白"
+                    "拖动框选, DEL 删除, 输数值+回车定尺寸, T 修剪, "
+                    "E 延伸, O 偏移, M 镜像, P 阵列) | 右键/Ctrl+Z 撤销, "
+                    "Ctrl+Shift+Z 重做 | ESC 提交退出")
         return {'RUNNING_MODAL'}
 
     def _align_view(self, context, datum):
@@ -331,6 +333,12 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             # 冲突排查：会话 modal 拦截一切非放行键（仅滚轮/中键透传），
             # Blender 编辑模式 S=缩放在会话内本就不生效，无实际冲突
             self._toggle_mode(context)
+            return {'RUNNING_MODAL'}
+
+        if (event.value == 'PRESS' and state.mode == "draw"
+                and state.draw_tool == "polygon"
+                and self._on_polygon_input_key(event.type)):
+            # 多边形边数数字收集（draw 模式专属；回车确认见 RET 分支）
             return {'RUNNING_MODAL'}
 
         if (event.value == 'PRESS' and state.mode == "draw"
@@ -422,6 +430,8 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                     state.input_buffer = ""
                 else:
                     self._apply_dimension()
+            elif state.draw_tool == "polygon" and state.input_buffer:
+                self._confirm_polygon_sides()
             elif state.draw_tool == "line":
                 state.stroke_open = False
             return {'RUNNING_MODAL'}
@@ -461,8 +471,11 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                 return {'RUNNING_MODAL'}
             if state.mode == "draw" and (
                     state.circle_center is not None
-                    or state.arc_p1 is not None or state.arc_p2 is not None):
-                # 圆/弧绘制进行中：先取消未完成的绘制，再按才退出草图
+                    or state.arc_p1 is not None or state.arc_p2 is not None
+                    or state.ellipse_center is not None
+                    or state.polygon_center is not None):
+                # 圆/弧/椭圆/多边形绘制进行中：先取消未完成的绘制，
+                # 再按才退出草图
                 self._cancel_curve_pending()
                 return {'RUNNING_MODAL'}
             if state.mode == "select" and (
@@ -888,6 +901,9 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             if eid is None:
                 return
             ent = self._entity_by_id(eid)
+            if ent.get("type") == "ellipse":
+                self.report({'WARNING'}, "偏移：椭圆暂不支持偏移")
+                return
             if (ent.get("type") == "line"
                     and self._find_loop_for(eid) is None):
                 by_id = {e["id"]: e for e in state.sketch.entities}
@@ -930,11 +946,20 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
     # ---- Mirror 镜像（SketchCAD.md §6，editing/mirror_pattern.py）----
 
     def _pick_multi(self, context, pending):
-        """点击累加/移出多选实体（mirror/pattern 选集共用）。"""
+        """点击累加/移出多选实体（mirror/pattern 选集共用）。
+
+        MVP 边界：ellipse 不参与镜像/阵列（副本变换器未适配，
+        Phase 4 批次 3 扩展），命中时提示并忽略。
+        """
         eid = picking.pick_entity(
             state.mouse_2d, state.sketch.entities,
             picking.SELECT_PIXEL_TOL * self._world_per_pixel(context))
         if eid is None:
+            return
+        ent = self._entity_by_id(eid)
+        if ent is not None and ent.get("type") == "ellipse":
+            self.report({'WARNING'},
+                        "镜像/阵列：椭圆暂不支持（后续版本扩展）")
             return
         if eid in pending:
             pending.remove(eid)
@@ -1337,7 +1362,8 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                 'CROSSHAIR' if state.mode == "draw" else 'DEFAULT')
         if state.mode == "draw":
             self.report({'INFO'},
-                        "SketchCAD：画线模式（L 直线 / C 圆 / A 三点弧）")
+                        "SketchCAD：画线模式（L 直线 / C 圆 / A 三点弧 / "
+                        "E 椭圆 / N 多边形）")
         else:
             self.report({'INFO'},
                         "SketchCAD：选择模式——点击实体选中，拖动端点/"
@@ -1348,16 +1374,22 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         self._cancel_curve_pending()
         state.stroke_open = False
         names = {'line': "直线", 'circle': "圆（两击：圆心→半径）",
-                 'arc': "三点弧（起点→弧上点→终点）"}
+                 'arc': "三点弧（起点→弧上点→终点）",
+                 'ellipse': "椭圆（三击：圆心→长轴端点→短轴）",
+                 'polygon': f"正多边形（{state.polygon_sides} 边，"
+                            "数字键改边数后两击：中心→顶点）"}
         self.report({'INFO'}, f"SketchCAD：{names.get(tool, tool)}工具")
 
     def _cancel_curve_pending(self):
         state.circle_center = None
         state.arc_p1 = None
         state.arc_p2 = None
+        state.ellipse_center = None
+        state.ellipse_major = None
+        state.polygon_center = None
 
     def _press_draw(self, context, p):
-        """draw 模式左键按下：按子工具分派（折线/圆/三点弧）。"""
+        """draw 模式左键按下：按子工具分派（折线/圆/三点弧/椭圆/多边形）。"""
         if state.draw_tool == "line":
             if not state.stroke_open:
                 # 新折线起点：只记录点，不与历史末点拼段
@@ -1369,6 +1401,10 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             self._press_circle(p)
         elif state.draw_tool == "arc":
             self._press_arc(p)
+        elif state.draw_tool == "ellipse":
+            self._press_ellipse(p)
+        elif state.draw_tool == "polygon":
+            self._press_polygon(p)
 
     def _press_circle(self, p):
         """圆两击状态机：第一击定圆心，第二击定半径并写入实体。"""
@@ -1411,6 +1447,103 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         self._push_undo()
         state.sketch.add_arc(center, r, a1, a2)
         self._refresh_dof()
+
+    def _press_ellipse(self, p):
+        """椭圆三击状态机：圆心 → 长轴端点（定 a/rot）→ 短轴定 b。
+
+        第三击距离超过长轴时由 add_ellipse 数据层规范化（轴交换 +
+        rot 转 90°），任意击点顺序都落到 a >= b 存储形态；半径级
+        尺寸过小视为误击取消。
+        """
+        if state.ellipse_center is None:
+            state.ellipse_center = (p[0], p[1])
+            return
+        c = state.ellipse_center
+        if state.ellipse_major is None:
+            a = ((p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2) ** 0.5
+            if a < _MIN_RADIUS:
+                self.report({'WARNING'},
+                            "椭圆：长轴过小，重新点击长轴端点")
+                return
+            state.ellipse_major = (a, math.atan2(p[1] - c[1],
+                                                 p[0] - c[0]))
+            return
+        a, rot = state.ellipse_major
+        b = ((p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2) ** 0.5
+        state.ellipse_center = None
+        state.ellipse_major = None
+        if b < _MIN_RADIUS and a < _MIN_RADIUS:
+            self.report({'WARNING'},
+                        "椭圆：尺寸过小，已取消（重新点击圆心）")
+            return
+        self._push_undo()
+        state.sketch.add_ellipse(c, a, b, rot)
+        self._refresh_dof()
+
+    def _press_polygon(self, p):
+        """多边形两击状态机：外接圆心 → 顶点方向（定半径/起始角）。
+
+        生成 N 条 line（N = state.polygon_sides，数字输入调整）+
+        相邻段 coincident 固接（含闭合段）；正多边形斜边不参与
+        水平/垂直推断（批量生成跳过自动约束推断，只写固接）。
+        """
+        if state.polygon_center is None:
+            state.polygon_center = (p[0], p[1])
+            return
+        c = state.polygon_center
+        r = ((p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2) ** 0.5
+        start = math.atan2(p[1] - c[1], p[0] - c[0])
+        state.polygon_center = None
+        verts = poly.polygon_vertices(c, r, start, state.polygon_sides)
+        if verts is None:
+            self.report({'WARNING'},
+                        "多边形：半径过小或边数无效，已取消"
+                        "（重新点击圆心）")
+            return
+        self._push_undo()
+        sketch = state.sketch
+        for i in range(len(verts)):
+            sketch.add_line(verts[i], verts[(i + 1) % len(verts)])
+        ids = [e["id"] for e in sketch.entities[-len(verts):]]
+        for i in range(len(ids)):
+            sketch.add_constraint(ac.COINCIDENT,
+                                  [ids[i], ids[(i + 1) % len(ids)]],
+                                  endpoints=[1, 0])
+        self._refresh_dof()
+        self.report({'INFO'},
+                    f"多边形完成：{len(ids)} 边"
+                    "（相邻段自动固接，闭合轮廓已识别）")
+
+    def _on_polygon_input_key(self, key_type):
+        """多边形边数数字收集（draw 模式 polygon 工具激活时）。
+
+        返回事件是否被消费；BACKSPACE 逐位删除，回车确认走
+        _confirm_polygon_sides（RET 分支）。
+        """
+        if key_type in _NUMPAD_DIGIT or key_type in _DIGIT_KEYS:
+            state.input_buffer += _NUMPAD_DIGIT.get(key_type, key_type)
+            return True
+        if key_type == 'BACKSPACE':
+            state.input_buffer = state.input_buffer[:-1]
+            return True
+        return False
+
+    def _confirm_polygon_sides(self):
+        """多边形边数输入确认：数字 + 回车（3~32 有效区间）。"""
+        try:
+            n = int(float(state.input_buffer))
+        except ValueError:
+            state.input_buffer = ""
+            return
+        state.input_buffer = ""
+        if not (poly.MIN_SIDES <= n <= poly.MAX_SIDES):
+            self.report({'WARNING'},
+                        f"多边形：边数须在 {poly.MIN_SIDES}~"
+                        f"{poly.MAX_SIDES} 之间")
+            return
+        state.polygon_sides = n
+        self.report({'INFO'},
+                    f"多边形边数已设为 {n}（两击绘制：中心→顶点方向）")
 
     def _clear_selection(self):
         """清空选集（主选中一并清除）。"""
@@ -1551,7 +1684,8 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                         e["p1"] = [x, y]
                     else:
                         e["p2"] = [x, y]
-                elif t == "circle" and pos == picking.POS_CENTER:
+                elif (t in ("circle", "ellipse")
+                        and pos == picking.POS_CENTER):
                     e["center"] = [x, y]
                 elif t == "arc" and pos in (0, 1):
                     # 拖弧端点：鼠标投影到圆周上反算角度（保持半径）；

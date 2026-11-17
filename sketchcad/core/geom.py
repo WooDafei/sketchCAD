@@ -98,3 +98,36 @@ def point_arc_distance(p, center, radius, a1, a2):
     d1 = math.hypot(p[0] - e1[0], p[1] - e1[1])
     d2 = math.hypot(p[0] - e2[0], p[1] - e2[1])
     return min(d1, d2)
+
+# ---- 椭圆（Phase 4 绘图增强）----
+
+# 椭圆离散折线的最大角步长（弧度）：与圆同密度，GPU/提交/框选共用
+ELLIPSE_MAX_STEP = 0.035
+
+
+def ellipse_normalize(a, b, rot):
+    """规范化椭圆参数：保证长半轴 a >= 短半轴 b。
+
+    b > a 时交换两轴并把 rot 转 90°（长轴方向同步换到另一轴）；
+    a == b 时 rot 保留原值（圆退化，方向无意义）。
+    返回 (A, B, ROT)。
+    """
+    if b > a:
+        return b, a, rot + math.pi / 2.0
+    return a, b, rot
+
+
+def ellipse_point(center, a, b, rot, angle):
+    """椭圆参数方程点：angle 为参数角（0..2π 逆时针，局部坐标）。"""
+    ca, sa = math.cos(angle), math.sin(angle)
+    cr, sr = math.cos(rot), math.sin(rot)
+    # 局部 (a*cosθ, b*sinθ) 绕 center 旋转 rot
+    return (center[0] + a * ca * cr - b * sa * sr,
+            center[1] + a * ca * sr + b * sa * cr)
+
+
+def ellipse_points(center, a, b, rot, max_step=ELLIPSE_MAX_STEP):
+    """椭圆 CCW 离散为闭合折线点序列（首尾点重合，与全圆约定一致）。"""
+    n = max(8, int(math.ceil(TWO_PI / max_step)))
+    return [ellipse_point(center, a, b, rot, TWO_PI * i / n)
+            for i in range(n + 1)]

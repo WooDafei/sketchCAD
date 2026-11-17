@@ -29,6 +29,10 @@ class SketchSession:
         self.circle_center = None   # 圆绘制：已确认圆心 (u, v)（None=未开始）
         self.arc_p1 = None          # 弧绘制：起点（三点式第一点）
         self.arc_p2 = None          # 弧绘制：弧上中间点（三点式第二点）
+        self.ellipse_center = None  # 椭圆绘制：圆心（三击式第一点）
+        self.ellipse_major = None   # 椭圆绘制：长轴 (a, rot)（三击式第二点）
+        self.polygon_center = None  # 多边形绘制：外接圆心（两击式第一点）
+        self.polygon_sides = 6      # 多边形边数（draw 模式数字输入 + 回车调整）
         self.tool = None            # select 模式编辑工具：None / 'trim' / 'extend'
         self.selected_entity = None # select 模式主选中实体 id（尺寸输入/N-Panel 用）
         self.selected_entities = [] # select 模式选集（id 列表，按选中顺序；主选中含于其中）

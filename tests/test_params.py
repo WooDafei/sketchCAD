@@ -36,3 +36,27 @@ def test_apply_roundtrip_and_field_preservation():
 def test_unknown_entity_type_raises():
     with pytest.raises(UnknownEntityTypeError):
         ParamLayout([{"id": 1, "type": "spline"}])
+
+def ellipse(eid, center, a, b, rot):
+    return {"id": eid, "type": "ellipse", "center": list(center),
+            "a": a, "b": b, "rot": rot}
+
+
+def test_ellipse_layout_and_pack():
+    ents = [line(1, (0, 0), (1, 0)), ellipse(2, (5, 5), 3.0, 2.0, 0.7)]
+    layout = ParamLayout(ents)
+    # line 4 参数 + ellipse 4 参数
+    assert layout.size == 8
+    assert layout.offsets[2] == 4
+    x = layout.pack(ents)
+    assert np.allclose(x, [0, 0, 1, 0, 5, 5, 3.0, 2.0])
+
+
+def test_ellipse_apply_preserves_rot():
+    # apply 回写 center/a/b，rot 为静态属性原样保留
+    e = ellipse(1, (5, 5), 3.0, 2.0, 0.7)
+    layout = ParamLayout([e])
+    layout.apply(np.array([1.0, 2.0, 4.0, 1.5]), [e])
+    assert e["center"] == [1.0, 2.0]
+    assert e["a"] == 4.0 and e["b"] == 1.5
+    assert e["rot"] == 0.7

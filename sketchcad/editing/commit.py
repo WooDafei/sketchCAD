@@ -13,7 +13,7 @@
 operator 层完成（face_sketch._remove_committed_edges）。
 """
 
-from ..core.geom import TWO_PI, arc_points
+from ..core.geom import TWO_PI, arc_points, ellipse_points
 
 _TOL_DECIMALS = 6
 
@@ -34,8 +34,9 @@ def entity_segments(e):
     """实体 -> 提交用折线段序列 [(p1, p2), ...]（2D 平面坐标）。
 
     line 一段；circle 离散为闭合折线（首尾点重合）；arc 离散为
-    开放折线。GPU 预览与 mesh 提交共用同一密度（geom.ARC_MAX_STEP），
-    保证提交快照与视口所见一致。
+    开放折线；ellipse 离散为闭合折线（与 GPU 预览同一密度）。
+    GPU 预览与 mesh 提交共用同一密度（geom.ARC_MAX_STEP /
+    ELLIPSE_MAX_STEP），保证提交快照与视口所见一致。
     """
     t = e.get("type")
     if t == "line":
@@ -45,6 +46,8 @@ def entity_segments(e):
         pts = arc_points(e["center"], e["radius"], 0.0, TWO_PI)
     elif t == "arc":
         pts = arc_points(e["center"], e["radius"], e["a1"], e["a2"])
+    elif t == "ellipse":
+        pts = ellipse_points(e["center"], e["a"], e["b"], e["rot"])
     else:
         return []
     return list(zip(pts, pts[1:]))
