@@ -27,6 +27,7 @@ from mathutils.geometry import intersect_line_plane
 from ..core import geom
 from ..core.state import state
 from ..drawing import polygon as poly
+from ..gpu import toolbar
 from ..solver.dof import STATUS_FULL, STATUS_OVER
 from ..snapping import aid_points as aid_pts
 from ..snapping import snap
@@ -229,6 +230,17 @@ def _draw_hud_text():
         blf.color(font_id, 0.35, 1.0, 0.45, 1.0)
         blf.position(font_id, 24, y)
         blf.draw(font_id, f"LOOPS: {len(state.loops)} closed profile(s)")
+
+    # 工具栏 hover 提示（视口顶部，显示工具名与用法）
+    if state.toolbar_hover:
+        region = bpy.context.region
+        if region is not None:
+            tip = toolbar.tooltip_for(state.mode, state.toolbar_hover,
+                                      region.height)
+            if tip:
+                blf.color(font_id, 1.0, 0.9, 0.4, 1.0)
+                blf.position(font_id, 50, region.height - 24)
+                blf.draw(font_id, tip)
 
 
 def draw_sketch():

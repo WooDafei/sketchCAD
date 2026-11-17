@@ -72,6 +72,7 @@ from ..editing import offset as off
 from ..editing import trim_extend as te
 from ..editing import transform as tr
 from ..editing.loops import detect_closed_loops
+from ..gpu import toolbar
 from ..gpu.draw_2d import draw_sketch
 from ..solver import apply as solver_apply
 from ..solver import dof as solver_dof
@@ -255,6 +256,9 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
 
         state.draw_handler = bpy.types.SpaceView3D.draw_handler_add(
             draw_sketch, (), 'WINDOW', 'POST_VIEW')
+        # 竖排工具栏（Phase 4）：屏幕空间 POST_PIXEL 层，随会话显隐
+        state.toolbar_handler = bpy.types.SpaceView3D.draw_handler_add(
+            toolbar.draw_toolbar, (), 'WINDOW', 'POST_PIXEL')
 
         # 进入即作图模式：十字光标（cursor_modal_set 随 operator
         # 结束自动恢复进入前的光标状态）
@@ -312,6 +316,7 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             return {'PASS_THROUGH'}
 
         if event.type == 'MOUSEMOVE':
+            self._update_toolbar_hover(context, event)
             self._update_mouse(context, event)
             if state.box_select_start is not None:
                 state.box_select_cur = (
@@ -370,6 +375,15 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            # 工具栏命中优先（屏幕空间按钮，点击等效快捷键；
+            # 未命中按钮的空隙区域照常走画布逻辑）
+            if context.region is not None:
+                rects = toolbar.layout(state.mode,
+                                       context.region.height)
+                action = toolbar.hit_test(
+                    event.mouse_region_x, event.mouse_region_y, rects)
+                if action is not None:
+                    return self._toolbar_action(context, action)
             if state.mouse_2d is not None:
                 if state.mode == "select":
                     if state.tool == 'trim':
@@ -1434,6 +1448,36 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         state.transform_preview = preview
         self._confirm_transform()
 
+    # ---- 竖排工具栏（Phase 4：屏幕空间按钮，点击等效快捷键）----
+
+    def _update_toolbar_hover(self, context, event):
+        """MOUSEMOVE 时更新 hover 按钮标记（绘制高亮与 HUD 提示用）。"""
+        region = context.region
+        if region is None:
+            state.toolbar_hover = None
+            return
+        rects = toolbar.layout(state.mode, region.height)
+        state.toolbar_hover = toolbar.hit_test(
+            event.mouse_region_x, event.mouse_region_y, rects)
+
+    def _toolbar_action(self, context, action):
+        """工具栏按钮点击分发：调与快捷键相同的处理函数。
+
+        finish 分支返回 _finish 的结果（{'FINISHED'} 结束会话），
+        其余统一 RUNNING_MODAL。
+        """
+        if action == "mode":
+            self._toggle_mode(context)
+        elif action == "undo":
+            self._undo()
+        elif action == "finish":
+            return self._finish(context)
+        elif action.startswith("draw:"):
+            self._set_draw_tool(action[len("draw:"):])
+        elif action.startswith("tool:"):
+            self._toggle_tool(action[len("tool:"):])
+        return {'RUNNING_MODAL'}
+
     def _confirm_segment(self, context, p2):
         """确认连续段：推断水平/垂直并吸附，写入实体与自动约束。
 
@@ -2132,6 +2176,14 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             except Exception:
                 pass
             state.draw_handler = None
+        if state.toolbar_handler is not None:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(
+                    state.toolbar_handler, 'WINDOW')
+            except Exception:
+                pass
+            state.toolbar_handler = None
+        state.toolbar_hover = None
 
         # 宿主 ghost 恢复（引用即取即用：按名取回，不长期持有）
         if state.host_obj_name and state.host_display_type is not None:

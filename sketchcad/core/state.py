@@ -71,6 +71,8 @@ class SketchSession:
         self.constraint_scroll_start = 0  # N-Panel 约束列表滚动起始索引（滚轮驱动）
         self.constraint_follow = True     # 跟随最新约束（滚回底部自动恢复）
         self.draw_handler = None
+        self.toolbar_handler = None  # 竖排工具栏 POST_PIXEL draw handler
+        self.toolbar_hover = None    # 当前 hover 的工具栏按钮 action（HUD 提示用）
         # 视图/视口状态快照（退出时恢复）
         self.view_rot = None
         self.view_loc = None
