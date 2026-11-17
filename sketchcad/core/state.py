@@ -61,6 +61,10 @@ class SketchSession:
         self.pattern_kind = None    # 'linear' / 'circular'（axis 选中后确定）
         self.pattern_step = None    # 已确认步距（线性=间距带符号；圆形=弧度增量带符号）
         self.pattern_preview = None # 阵列预览实体 dict 列表（step=单副本 / count=全量）
+        self.transform_stage = None   # 变换工具阶段：'anchor' 选基准点 / 'apply' 预览确认
+        self.transform_anchor = None  # 变换基准点 (u, v)：移动=位移原点 / 旋转缩放=中心
+        self.transform_ref = None     # apply 阶段初始鼠标参照（预览量相对此点计算）
+        self.transform_preview = None # 变换预览副本 dict 列表（apply 阶段非 None）
         self.aid_points = []        # 宿主顶点投影辅助点 [(u, v), ...]（进入时固化）
         self.host_obj_name = None   # 宿主对象名（ghost 恢复用，引用即取即用）
         self.host_display_type = None  # 进入前宿主 display_type 快照（退出恢复）

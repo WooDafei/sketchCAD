@@ -212,6 +212,28 @@ class SketchData:
                 return True
         return False
 
+    def remove_constraints_across_selection(self, selected_ids):
+        """删除固接类约束中跨选集边界的引用（变换工具级联语义）。
+
+        coincident / point_on_line 的 targets 同时含选集内与选集外
+        实体时，选集整体移动/旋转/缩放会拉断原连接——固接约束与
+        变换意图矛盾，确认时级联移除；选集内部互连约束与完全不涉
+        及选集实体的约束保留（方向/尺寸语义约束一律保留）。返回
+        删除数量。
+        """
+        sel = set(selected_ids)
+
+        def across(c):
+            if c.get("type") not in ("coincident", "point_on_line"):
+                return False
+            targets = c.get("targets") or []
+            return (any(t in sel for t in targets)
+                    and any(t not in sel for t in targets))
+
+        before = len(self.constraints)
+        self.constraints = [c for c in self.constraints if not across(c)]
+        return before - len(self.constraints)
+
     def line_segments(self):
         out = []
         for e in self.entities:

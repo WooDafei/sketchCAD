@@ -56,6 +56,12 @@ _TOOL_HINT = {
     "pattern": ("PATTERN: click entities | Enter | click a line "
                 "(linear) or circle/arc (circular) | move/type step + "
                 "Enter | type count + Enter | ESC steps back"),
+    "move": ("MOVE: click base point | move to preview | click to "
+             "confirm | ESC steps back"),
+    "rotate": ("ROTATE: click center | move to preview or type angle "
+               "+ Enter | click confirms | ESC steps back"),
+    "scale": ("SCALE: click center | move to preview or type factor "
+              "+ Enter | click confirms | ESC steps back"),
 }
 
 _DRAW_TOOL_HINT = {
@@ -520,6 +526,25 @@ def draw_sketch():
         if state.pattern_preview:
             for e in state.pattern_preview:
                 _draw_entity_preview(shader, d, e, _COLOR_RUBBER)
+
+    # 3.85 变换工具预览（move/rotate/scale：变换后选集副本，黄色，
+    # 与 mirror/pattern 预览同色系）
+    if (state.tool in ('move', 'rotate', 'scale')
+            and state.transform_preview):
+        for e in state.transform_preview:
+            _draw_entity_preview(shader, d, e, _COLOR_RUBBER)
+
+    # 3.86 变换基准点标记（apply 阶段橙色大点：移动原点 / 旋转缩放中心）
+    if (state.tool in ('move', 'rotate', 'scale')
+            and state.transform_anchor is not None):
+        c = state.transform_anchor
+        gpu.state.point_size_set(10.0)
+        batch = batch_for_shader(shader, 'POINTS', {
+            "pos": [d.to_world(c[0], c[1])]})
+        shader.bind()
+        shader.uniform_float("color", _COLOR_SELECTED)
+        batch.draw(shader)
+        gpu.state.point_size_set(8.0)
 
     # 3.9 框选矩形（select 模式空白处拖动）：按下/当前屏幕坐标经
     # 射线与基准面求交转 2D，四角 to_world 以基准面轴对齐矩形绘制

@@ -167,3 +167,32 @@ def test_remove_endpoint_default_endpoints_semantics():
     s.add_constraint("point_on_line", [2, 1], endpoints=[0, None])
     assert s.remove_constraints_for_endpoint(1, 1) == 1
     assert s.remove_constraints_for_endpoint(2, 0) == 1
+
+# ---- Phase 4：跨选集固接约束级联（变换工具）----
+
+def test_remove_constraints_across_selection():
+    s = make_sketch()
+    s.add_line((0, 0), (3, 0))      # id 1（选集内）
+    s.add_line((3, 0), (3, 2))      # id 2（选集外）
+    s.add_line((10, 10), (12, 12))  # id 3（选集内）
+    s.add_constraint("coincident", [1, 2], endpoints=[1, 0])  # id 4 跨界 → 删
+    s.add_constraint("coincident", [1, 3], endpoints=[0, 0])  # id 5 全选集内 → 留
+    s.add_constraint("horizontal", [1])                       # id 6 方向约束 → 留
+    s.add_constraint("point_on_line", [3, 2],
+                     endpoints=[0, None])                     # id 7 跨界 → 删
+    n = s.remove_constraints_across_selection([1, 3])
+    assert n == 2
+    ids = {c["id"] for c in s.constraints}
+    assert 4 not in ids and 7 not in ids
+    assert 5 in ids and 6 in ids
+
+
+def test_remove_across_selection_no_cross_returns_zero():
+    s = make_sketch()
+    s.add_line((0, 0), (3, 0))              # id 1
+    s.add_constraint("coincident", [1, 1])  # 自引用，全在选集内
+    assert s.remove_constraints_across_selection([1]) == 0
+    # 选集含不存在的 id：另一实体不在选集 → 跨界约束被删
+    s.add_line((1, 1), (2, 2))              # id 3
+    s.add_constraint("coincident", [1, 3])  # id 4
+    assert s.remove_constraints_across_selection([1, 99]) == 1

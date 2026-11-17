@@ -70,6 +70,7 @@ from ..editing import commit as cmt
 from ..editing import mirror_pattern as mp
 from ..editing import offset as off
 from ..editing import trim_extend as te
+from ..editing import transform as tr
 from ..editing.loops import detect_closed_loops
 from ..gpu.draw_2d import draw_sketch
 from ..solver import apply as solver_apply
@@ -84,9 +85,11 @@ _DIGIT_KEYS = {str(i) for i in range(10)}
 _NUMPAD_DIGIT = {f"NUMPAD_{i}": str(i) for i in range(10)}
 _PERIOD_KEYS = ('PERIOD', 'NUMPAD_PERIOD')
 
-# select 模式编辑工具快捷键（T 修剪 / E 延伸 / O 偏移 / M 镜像 / P 阵列）
+# select 模式编辑工具快捷键（T 修剪 / E 延伸 / O 偏移 / M 镜像 /
+# P 阵列 / G 移动 / R 旋转 / X 缩放）
 _TOOL_KEYS = {'T': 'trim', 'E': 'extend', 'O': 'offset',
-              'M': 'mirror', 'P': 'pattern'}
+              'M': 'mirror', 'P': 'pattern',
+              'G': 'move', 'R': 'rotate', 'X': 'scale'}
 
 # draw 模式子工具快捷键（L 直线 / C 圆 / A 三点弧 / E 椭圆 / N 正多边形）
 _DRAW_TOOL_KEYS = {'L': 'line', 'C': 'circle', 'A': 'arc',
@@ -322,6 +325,9 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             if (state.tool == 'pattern'
                     and state.pattern_stage in ('step', 'count')):
                 self._update_pattern_preview()
+            if (state.tool in ('move', 'rotate', 'scale')
+                    and state.transform_stage == 'apply'):
+                self._update_transform_preview()
             return {'RUNNING_MODAL'}
 
         if event.type == 'TAB' and event.value == 'PRESS':
@@ -350,6 +356,8 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                 and (state.offset_pending is not None
                      or (state.tool == 'pattern'
                          and state.pattern_stage in ('step', 'count'))
+                     or (state.tool in ('rotate', 'scale')
+                         and state.transform_stage == 'apply')
                      or (state.tool is None
                          and state.selected_entity is not None))):
             # 数值输入：选中实体定尺寸、偏移距离或阵列步距/份数
@@ -374,6 +382,8 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                         self._apply_mirror(context)
                     elif state.tool == 'pattern':
                         self._apply_pattern(context)
+                    elif state.tool in ('move', 'rotate', 'scale'):
+                        self._apply_transform(context)
                     else:
                         self._press_select(context, event, state.mouse_2d)
                 else:
@@ -428,6 +438,11 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                     # 数值确认：按输入距离偏移（侧向用当前鼠标位置）
                     self._confirm_offset()
                     state.input_buffer = ""
+                elif (state.tool in ('rotate', 'scale')
+                        and state.transform_stage == 'apply'
+                        and state.input_buffer):
+                    # 变换数值确认：旋转=角度(度) / 缩放=比例因子
+                    self._confirm_transform_by_value()
                 else:
                     self._apply_dimension()
             elif state.draw_tool == "polygon" and state.input_buffer:
@@ -466,6 +481,20 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                 elif state.offset_pending is not None:
                     state.offset_pending = None
                     state.offset_preview = None
+                elif (state.tool in ('move', 'rotate', 'scale')
+                        and state.transform_stage == 'apply'):
+                    # 变换 apply 阶段：回退到 anchor 重选基准点
+                    state.transform_stage = 'anchor'
+                    state.transform_anchor = None
+                    state.transform_ref = None
+                    state.transform_preview = None
+                    state.input_buffer = ""
+                    self.report({'INFO'},
+                                "变换：已重置，重新点击基准点"
+                                "（再按 ESC 退出工具）")
+                elif state.tool in ('move', 'rotate', 'scale'):
+                    state.tool = None
+                    self.report({'INFO'}, "SketchCAD：编辑工具已退出")
                 else:
                     state.tool = None
                 return {'RUNNING_MODAL'}
@@ -604,9 +633,12 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
 
     def _toggle_tool(self, tool):
         state.tool = None if state.tool == tool else tool
-        state.selected_entity = None
-        state.selected_entities = []
         state.input_buffer = ""
+        # 变换工具作用于既有选集（激活时保留选集），其余工具为
+        # 单实体语义，激活即清选集
+        if state.tool not in ('move', 'rotate', 'scale'):
+            state.selected_entity = None
+            state.selected_entities = []
         state.extend_pending = None
         state.extend_preview = None
         state.offset_pending = None
@@ -621,6 +653,10 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         state.pattern_kind = None
         state.pattern_step = None
         state.pattern_preview = None
+        state.transform_stage = None
+        state.transform_anchor = None
+        state.transform_ref = None
+        state.transform_preview = None
         if state.tool is None:
             self.report({'INFO'}, "SketchCAD：编辑工具已退出")
         elif state.tool == 'trim':
@@ -642,12 +678,29 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
                         "SketchCAD 镜像：点击选择实体（可多选，再点"
                         "取消），Enter 确认后点击一条线作镜像轴，"
                         "Enter 生成")
-        else:
+        elif state.tool == 'pattern':
             state.pattern_stage = 'pick'
             self.report({'INFO'},
                         "SketchCAD 阵列：点击选择实体（可多选），"
                         "Enter 确认后点击线（线性）或圆/弧（圆形）"
                         "定参照，按提示定步距与份数")
+        else:  # move / rotate / scale：作用于当前选集
+            if not state.selected_entities:
+                state.tool = None
+                self.report({'WARNING'},
+                            "移动/旋转/缩放：请先选择实体"
+                            "（点击、Shift+点击或框选）")
+                return
+            state.transform_stage = 'anchor'
+            tips = {
+                'move': "SketchCAD 移动：点击基准点（位移=鼠标相对"
+                        "基准点的位移），移动鼠标预览，点击确认",
+                'rotate': "SketchCAD 旋转：点击旋转中心，移动鼠标"
+                          "预览（或输角度+回车），点击确认",
+                'scale': "SketchCAD 缩放：点击缩放中心，移动鼠标"
+                         "预览（或输比例+回车），点击确认",
+            }
+            self.report({'INFO'}, tips[state.tool])
 
     def _pick_for_tool(self, context):
         """trim/extend 工具拾取：line/arc 实体（circle 整圆不参与）。"""
@@ -1237,8 +1290,149 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
             if s.pattern_pending:
                 s.pattern_pending = []
             else:
-                s.tool = None
+                state.tool = None
                 self.report({'INFO'}, "SketchCAD：编辑工具已退出")
+
+    # ---- Move/Rotate/Scale 变换工具（SketchCAD.md Phase 4，
+    # editing/transform.py 副本变换 + 跨选集固接约束级联移除）----
+
+    def _selected_entities_or_none(self):
+        """选集实体列表；选集为空或含已失效实体（撤销等）返回 None。"""
+        ents = [self._entity_by_id(eid)
+                for eid in state.selected_entities]
+        if not ents or any(e is None for e in ents):
+            return None
+        return ents
+
+    def _apply_transform(self, context):
+        """变换两段式：anchor（点击基准点）→ apply（预览 + 确认）。
+
+        确认后回到 anchor 阶段（连续变换操作），ESC 退出工具。
+        """
+        if state.transform_stage == 'anchor':
+            if state.mouse_2d is None:
+                return
+            state.transform_anchor = tuple(state.mouse_2d)
+            state.transform_ref = tuple(state.mouse_2d)
+            state.transform_stage = 'apply'
+            self._update_transform_preview()
+            if state.tool == 'move':
+                hint = "移动：移动鼠标预览，点击确认（ESC 重选基准点）"
+            elif state.tool == 'rotate':
+                hint = ("旋转：移动鼠标预览或输角度(度)+回车，"
+                        "点击确认（ESC 重选中心）")
+            else:
+                hint = ("缩放：移动鼠标预览或输比例+回车，"
+                        "点击确认（ESC 重选中心）")
+            self.report({'INFO'}, hint)
+            return
+        self._confirm_transform()
+
+    def _transform_preview_fn(self):
+        """apply 阶段预览变换函数：数值缓冲优先，否则鼠标驱动现算。
+
+        移动无数值路径（位移=鼠标相对基准点位移，数值无独立语义）；
+        旋转缓冲=角度度数（正=CCW）；缩放缓冲=比例因子（>0）。
+        返回 变换函数 或 None（参数无效/鼠标缺失）。
+        """
+        if state.mouse_2d is None:
+            return None
+        buffered = None
+        if state.input_buffer:
+            try:
+                buffered = float(state.input_buffer)
+            except ValueError:
+                buffered = None
+        if state.tool == 'move':
+            dx = state.mouse_2d[0] - state.transform_ref[0]
+            dy = state.mouse_2d[1] - state.transform_ref[1]
+            return lambda e: tr.moved_entity(e, dx, dy)
+        anchor = state.transform_anchor
+        if state.tool == 'rotate':
+            if buffered is not None:
+                ang = math.radians(buffered)
+            else:
+                ref = state.transform_ref
+                ang = (math.atan2(state.mouse_2d[1] - anchor[1],
+                                  state.mouse_2d[0] - anchor[0])
+                       - math.atan2(ref[1] - anchor[1],
+                                    ref[0] - anchor[0]))
+            return lambda e: tr.rotated_entity(e, anchor, ang)
+        # scale：鼠标驱动 = 当前/初始鼠标到中心距离比
+        if buffered is not None:
+            factor = buffered
+        else:
+            d_ref = math.hypot(state.transform_ref[0] - anchor[0],
+                               state.transform_ref[1] - anchor[1])
+            if d_ref < 1e-9:
+                return None
+            factor = math.hypot(state.mouse_2d[0] - anchor[0],
+                                state.mouse_2d[1] - anchor[1]) / d_ref
+        return lambda e: tr.scaled_entity(e, anchor, factor)
+
+    def _update_transform_preview(self):
+        ents = self._selected_entities_or_none()
+        if ents is None:
+            state.transform_preview = None
+            return
+        fn = self._transform_preview_fn()
+        if fn is None:
+            state.transform_preview = None
+            return
+        state.transform_preview = tr.transform_batch(ents, fn)
+
+    def _confirm_transform(self):
+        """确认变换：几何字段写回原实体 + 跨选集固接约束级联移除。
+
+        选集内部相对约束保留（整体变换不破坏内部相对关系）；
+        方向/尺寸语义约束一律保留。
+        """
+        ents = self._selected_entities_or_none()
+        preview = state.transform_preview
+        if ents is None or not preview:
+            self.report({'WARNING'},
+                        "变换：预览无效（选集含失效实体或参数退化），"
+                        "换个位置再确认")
+            return
+        self._push_undo()
+        for orig, new in zip(ents, preview):
+            tr.apply_geometry(orig, new)
+        n_removed = state.sketch.remove_constraints_across_selection(
+            state.selected_entities)
+        # 确认后回 anchor 阶段（连续变换），ESC 退出工具
+        state.transform_stage = 'anchor'
+        state.transform_anchor = None
+        state.transform_ref = None
+        state.transform_preview = None
+        state.input_buffer = ""
+        self._refresh_dof()
+        msg = f"{state.tool} 完成"
+        if n_removed:
+            msg += f"（{n_removed} 条跨选集固接约束已移除）"
+        self.report({'INFO'}, msg)
+
+    def _confirm_transform_by_value(self):
+        """旋转/缩放的数值确认路径（apply 阶段输数字 + 回车）。"""
+        try:
+            v = float(state.input_buffer)
+        except ValueError:
+            state.input_buffer = ""
+            return
+        state.input_buffer = ""
+        ents = self._selected_entities_or_none()
+        if ents is None:
+            return
+        anchor = state.transform_anchor
+        if state.tool == 'rotate':
+            fn = lambda e: tr.rotated_entity(e, anchor, math.radians(v))
+        else:
+            fn = lambda e: tr.scaled_entity(e, anchor, v)
+        preview = tr.transform_batch(ents, fn)
+        if preview is None:
+            self.report({'WARNING'}, "变换：参数无效（比例须为正数）")
+            return
+        state.transform_preview = preview
+        self._confirm_transform()
 
     def _confirm_segment(self, context, p2):
         """确认连续段：推断水平/垂直并吸附，写入实体与自动约束。
@@ -1350,6 +1544,10 @@ class SKETCH_OT_face_driven_sketch(bpy.types.Operator):
         state.pattern_kind = None
         state.pattern_step = None
         state.pattern_preview = None
+        state.transform_stage = None
+        state.transform_anchor = None
+        state.transform_ref = None
+        state.transform_preview = None
         state.mode = "select" if state.mode == "draw" else "draw"
         state.selected_entity = None
         state.selected_entities = []
